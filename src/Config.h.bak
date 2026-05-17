@@ -1,0 +1,45 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// --- PIN MAP ---
+#define PWMA 27   
+#define AIN1 18
+#define AIN2 19
+#define PWMB 13    
+#define BIN1 5   
+#define BIN2 23   
+
+// --- SENSOR PINS (Tái định tuyến theo bảng mới) ---
+#define S1_PIN 36 // Trái ngoài cùng (Sensor 7)
+#define S2_PIN 39 // Sensor 6
+#define S3_PIN 34 // Sensor 5
+#define S4_PIN 35 // Sensor 4
+#define S5_PIN 32 // Sensor 3
+#define S6_PIN 33 // Sensor 2
+#define S7_PIN 25 // Sensor 1
+#define S8_PIN 26 // Phải ngoài cùng (Sensor 0)
+
+// --- SETTINGS ---
+#define NUM_SENSORS 8
+const bool BLACK_HIGH = false; 
+const bool INVERT_LEFT_MOTOR  = false;
+const bool INVERT_RIGHT_MOTOR = true; 
+
+const int LEFT_OFFSET  = 0;     
+const int RIGHT_OFFSET = 0; 
+
+// --- CÂN BẰNG CẢM BIẾN (Software Gain) ---
+// Dựa trên dữ liệu thực tế: [3091 3553 3450 3426 2977 3379 3554 3440]
+// Ta bù các mắt yếu (như mắt 4 và mắt 0) để tất cả về mức trung bình.
+const float SENSOR_GAINS[8] = {
+  1.02f, // S1 - Giảm nhẹ để tránh vọt lên 4000
+  0.96f, // S2
+  0.99f, // S3
+  1.00f, // S4
+  1.15f, // S5 - Giữ nguyên vì đã rất cân bằng
+  1.00f, // S6
+  0.97f, // S7
+  0.98f  // S8
+};
+
+#endif

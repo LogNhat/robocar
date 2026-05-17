@@ -1,0 +1,263 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Arduino.h>
+#include <Wire.h>
+
+Adafruit_MPU6050 mpu;
+
+const int numSensors = 8;
+const int sensorPins[numSensors] = {26, 25, 33, 32, 35, 34, 39, 36};
+
+const int thresholdValues[numSensors] = {3185, 3327, 3091, 3071,
+                                         3192, 3113, 3450, 2787};
+
+// TB6612FNG
+const int PWMA = 27;
+const int AIN1 = 18;
+const int AIN2 = 19;
+
+const int PWMB = 13;
+const int BIN1 = 5;
+const int BIN2 = 23;
+
+// Cascade PD + Gyro P
+float lineKp = 0.00185;
+float lineKd = 0.0052;
+float gyroKp = 72.0;
+
+float gyroZOffset = 0.0;
+
+// Speed tuning
+int fullSpeed = 255;
+int fastSpeed = 255;
+int midSpeed = 240;
+int curveSpeed = 180;
+int searchSpeed = 150;
+
+int currentSpeed = 200;
+int speedStepUp = 25;
+int speedStepDown = 60;
+
+int lastError = 0;
+bool lineDetected = false;
+bool sensorBlack[numSensors];
+
+float filteredError = 0;
+float errorAlpha = 0.60;
+
+void setupMotors() {
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+#else
+  ledcSetup(0, 5000, 8);
+  ledcAttachPin(PWMA, 0);
+  ledcSetup(1, 5000, 8);
+  ledcAttachPin(PWMB, 1);
+#endif
+}
+
+void setMotorLeft(int speed) {
+  speed = constrain(speed, -255, 255);
+
+  if (speed >= 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    speed = -speed;
+  }
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  analogWrite(PWMB, speed);
+#else
+  ledcWrite(1, speed);
+#endif
+}
+
+void setMotorRight(int speed) {
+  speed = constrain(speed, -255, 255);
+
+  if (speed >= 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    speed = -speed;
+  }
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  analogWrite(PWMA, speed);
+#else
+  ledcWrite(0, speed);
+#endif
+}
+
+void rampSpeedTo(int targetSpeed) {
+  if (currentSpeed < targetSpeed) {
+    currentSpeed += speedStepUp;
+    if (currentSpeed > targetSpeed)
+      currentSpeed = targetSpeed;
+  } else if (currentSpeed > targetSpeed) {
+    currentSpeed -= speedStepDown;
+    if (currentSpeed < targetSpeed)
+      currentSpeed = targetSpeed;
+  }
+}
+
+void calibrateGyro() {
+  Serial.println("Calibrating gyro... keep robot still");
+
+  sensors_event_t accel, gyro, temp;
+  float sum = 0;
+  const int samples = 500;
+
+  for (int i = 0; i < samples; i++) {
+    mpu.getEvent(&accel, &gyro, &temp);
+    sum += gyro.gyro.z;
+    delay(2);
+  }
+
+  gyroZOffset = sum / samples;
+
+  Serial.print("gyroZOffset = ");
+  Serial.println(gyroZOffset, 6);
+}
+
+float readGyroZ() {
+  sensors_event_t accel, gyro, temp;
+  mpu.getEvent(&accel, &gyro, &temp);
+  return gyro.gyro.z - gyroZOffset;
+}
+
+int readLineError() {
+  long weightedSum = 0;
+  int activeCount = 0;
+
+  for (int i = 0; i < numSensors; i++) {
+    int value = analogRead(sensorPins[i]);
+    sensorBlack[i] = value < thresholdValues[i];
+
+    if (sensorBlack[i]) {
+      int reversedIndex = numSensors - 1 - i;
+      weightedSum += reversedIndex * 1000;
+      activeCount++;
+    }
+  }
+
+  lineDetected = activeCount > 0;
+
+  if (lineDetected) {
+    int position = weightedSum / activeCount;
+    return position - 3500;
+  }
+
+  return lastError;
+}
+
+int getTargetSpeed(int absError) {
+  bool centerLine = sensorBlack[3] && sensorBlack[4];
+
+  if (centerLine && absError < 700)
+    return fullSpeed;
+  if (absError < 1300)
+    return fastSpeed;
+  if (absError < 2300)
+    return midSpeed;
+  return curveSpeed;
+}
+
+void searchLine() {
+  currentSpeed = searchSpeed;
+
+  if (lastError > 0) {
+    setMotorLeft(searchSpeed);
+    setMotorRight(-searchSpeed);
+  } else {
+    setMotorLeft(-searchSpeed);
+    setMotorRight(searchSpeed);
+  }
+}
+
+void followLineCascade() {
+  int rawError = readLineError();
+
+  if (!lineDetected) {
+    searchLine();
+    return;
+  }
+
+  filteredError = filteredError * (1.0 - errorAlpha) + rawError * errorAlpha;
+  int error = filteredError;
+
+  int derivative = error - lastError;
+  int absError = abs(error);
+
+  float gyroZ = readGyroZ();
+
+  float targetTurnRate = lineKp * error + lineKd * derivative;
+  targetTurnRate = constrain(targetTurnRate, -5.2, 5.2);
+
+  float turnError = targetTurnRate + gyroZ;
+
+  int correction = gyroKp * turnError;
+
+  if (absError < 700) {
+    correction = constrain(correction, -120, 120);
+  } else if (absError < 1800) {
+    correction = constrain(correction, -220, 220);
+  } else {
+    correction = constrain(correction, -255, 255);
+  }
+
+  int targetSpeed = getTargetSpeed(absError);
+  rampSpeedTo(targetSpeed);
+
+  int leftSpeed = currentSpeed + correction;
+  int rightSpeed = currentSpeed - correction;
+
+  leftSpeed = constrain(leftSpeed, 0, 255);
+  rightSpeed = constrain(rightSpeed, 0, 255);
+
+  setMotorLeft(leftSpeed);
+  setMotorRight(rightSpeed);
+
+  lastError = error;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(21, 22);
+
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("MPU6050 NOT FOUND!");
+    while (1)
+      delay(100);
+  }
+
+  Serial.println("MPU6050 CONNECTED!");
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  for (int i = 0; i < numSensors; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
+
+  setupMotors();
+  calibrateGyro();
+
+  Serial.println("START FAST NO-DELAY CASCADE");
+}
+
+void loop() { followLineCascade(); }

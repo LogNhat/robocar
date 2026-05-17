@@ -1,0 +1,61 @@
+#include <Arduino.h>
+#include "Config.h"
+#include "Motor.h"
+#include "Sensor.h"
+
+// ================= PID CONSTANTS =================
+// Cần tinh chỉnh theo thực tế
+float Kp = 0.08;
+float Kd = 1.00;
+
+// ================= SPEED SETTINGS =================
+int MAX_SPEED = 200; // Tốc độ chạy thẳng
+int MIN_SPEED = 80;  // Tốc độ thấp nhất khi bẻ cua gắt
+
+// ================= VARIABLES =================
+int lastError = 0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Khởi tạo các module
+  motorSetup();
+  sensorSetup();
+  
+  // 1. Calibrate (Quét qua lại trên vạch đen)
+  calibrateSensors();
+  
+  // 2. Chờ 2 giây trước khi chạy
+  Serial.println("BAT DAU DO LINE TRONG 2 GIAY!");
+  stopMotor();
+  delay(2000);
+}
+
+void loop() {
+  // 1. Đọc vị trí vạch (0 -> 7000, giữa là 3500)
+  int position = getLinePosition(); 
+  int error = position - 3500;
+  
+  // 2. Tính toán PID
+  int derivative = error - lastError;
+  float correction = Kp * error + Kd * derivative;
+  
+  // 3. ĐIỀU KHIỂN TỐC ĐỘ THÍCH ỨNG (Dynamic Speed)
+  // Khi error = 0 (chạy thẳng), base_speed = MAX_SPEED
+  // Khi abs(error) = 3500 (cua gắt), base_speed = MIN_SPEED
+  int base_speed = map(abs(error), 0, 3500, MAX_SPEED, MIN_SPEED);
+  base_speed = constrain(base_speed, MIN_SPEED, MAX_SPEED);
+
+  // 4. Áp dụng correction vào 2 bánh
+  int leftS = base_speed + correction + LEFT_OFFSET;
+  int rightS = base_speed - correction + RIGHT_OFFSET;
+
+  // 5. Điều khiển motor
+  setMotor(leftS, rightS);
+  
+  // Lưu lại error cho lần tính Đạo hàm tiếp theo
+  lastError = error;
+  
+  // Tránh việc loop chạy quá nhanh gây nhiễu cho việc tính Derivative
+  delay(1); 
+}

@@ -1,0 +1,61 @@
+#include <Arduino.h>
+#include "Motor.h"
+#include "Config.h"
+
+void motorSetup() {
+  pinMode(AIN1, OUTPUT); 
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT); 
+  pinMode(BIN2, OUTPUT);
+  
+  ledcSetup(0, 20000, 8); 
+  ledcSetup(1, 20000, 8);
+  ledcAttachPin(PWMA, 0); 
+  ledcAttachPin(PWMB, 1);
+}
+
+void setMotor(int left, int right) {
+  left = constrain(left, -255, 255);
+  right = constrain(right, -255, 255);
+  if (INVERT_LEFT_MOTOR) left = -left;
+  if (INVERT_RIGHT_MOTOR) right = -right;
+
+  // Motor Trái (A)
+  digitalWrite(AIN1, left >= 0 ? HIGH : LOW);
+  digitalWrite(AIN2, left >= 0 ? LOW : HIGH);
+  ledcWrite(0, abs(left));
+
+  // Motor Phải (B)
+  digitalWrite(BIN1, right >= 0 ? HIGH : LOW);
+  digitalWrite(BIN2, right >= 0 ? LOW : HIGH);
+  ledcWrite(1, abs(right));
+}
+
+void stopMotor() {
+  setMotor(0, 0);
+}
+
+// BÙ DẢI CHẾT (Deadband Compensation)
+// Truyền vào tốc độ từ -100% đến 100%
+void setTrueSpeed(float leftPercent, float rightPercent) {
+  const int MIN_PWM = 80; // Ngưỡng PWM nhỏ nhất mà xe có thể nhúc nhích
+  
+  int leftPWM = 0;
+  int rightPWM = 0;
+
+  // Bánh Trái
+  if (leftPercent > 0) {
+    leftPWM = map(leftPercent, 0, 100, MIN_PWM, 255);
+  } else if (leftPercent < 0) {
+    leftPWM = map(leftPercent, -100, 0, -255, -MIN_PWM);
+  }
+
+  // Bánh Phải
+  if (rightPercent > 0) {
+    rightPWM = map(rightPercent, 0, 100, MIN_PWM, 255);
+  } else if (rightPercent < 0) {
+    rightPWM = map(rightPercent, -100, 0, -255, -MIN_PWM);
+  }
+
+  setMotor(leftPWM, rightPWM);
+}

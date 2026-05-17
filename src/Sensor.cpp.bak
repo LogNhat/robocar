@@ -1,0 +1,77 @@
+#include <Arduino.h>
+#include "Sensor.h"
+#include "Config.h"
+
+const int qtrPins[8] = {S1_PIN, S2_PIN, S3_PIN, S4_PIN, S5_PIN, S6_PIN, S7_PIN, S8_PIN};
+
+int sensorMin[NUM_SENSORS] = {4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095};
+int sensorMax[NUM_SENSORS] = {0, 0, 0, 0, 0, 0, 0, 0};
+int lastPosition = 3500;
+
+void sensorSetup() {
+  analogReadResolution(12);   // ESP32 ADC 12-bit (0-4095)
+}
+
+void calibrateSensors() {
+  Serial.println("\n--- BAT DAU CALIB (5 GIAY) ---");
+  Serial.println("HAY QUET CAM BIEN QUA LAI TREN VACH DEN!");
+  unsigned long start = millis();
+  
+  while (millis() - start < 5000) {
+    for (int i = 0; i < NUM_SENSORS; i++) {
+      int val = analogRead(qtrPins[i]) * SENSOR_GAINS[i];
+      if (val < sensorMin[i]) sensorMin[i] = val;
+      if (val > sensorMax[i]) sensorMax[i] = val;
+    }
+    delay(5);
+  }
+  
+  Serial.println("--- KET QUA CALIB ---");
+  for(int i=0; i<8; i++) Serial.printf("M%d: %d-%d | ", i+1, sensorMin[i], sensorMax[i]);
+  Serial.println("\n(Neu Min/Max giong nhau la chua quet vach!)");
+}
+
+int getLinePosition() {
+  long weightedSum = 0;
+  long sum = 0;
+  
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int val = analogRead(qtrPins[i]) * SENSOR_GAINS[i];
+    
+    // Đưa giá trị về thang đo 0-1000
+    int calVal = map(val, sensorMin[i], sensorMax[i], 0, 1000);
+    calVal = constrain(calVal, 0, 1000);
+    
+    if (!BLACK_HIGH) calVal = 1000 - calVal; // Đảo lại nếu nền đen vạch trắng
+    
+    // Cắt nhiễu
+    if (calVal < 150) calVal = 0; 
+    
+    weightedSum += (long)calVal * (i * 1000);
+    sum += calVal;
+  }
+  
+  // NẾU MẤT VẠCH HOÀN TOÀN (sum quá nhỏ)
+  if (sum < 100) {
+    // Trả về phía ngoài cùng tùy thuộc vào lần cuối cùng xe thấy vạch ở bên nào
+    return (lastPosition < 3500) ? 0 : 7000;
+  }
+  
+  lastPosition = weightedSum / sum;
+  return lastPosition;
+}
+
+bool isAllBlack() {
+  long sum = 0;
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    int val = analogRead(qtrPins[i]) * SENSOR_GAINS[i];
+    int calVal = map(val, sensorMin[i], sensorMax[i], 0, 1000);
+    calVal = constrain(calVal, 0, 1000);
+    if (!BLACK_HIGH) calVal = 1000 - calVal;
+    sum += calVal;
+  }
+  
+  // Nếu cả 8 mắt đều thấy vạch đen, sum sẽ xấp xỉ 8000
+  // Đặt ngưỡng > 6000 (tức là phần lớn các mắt đang ở trên vạch đen)
+  return sum > 6000;
+}

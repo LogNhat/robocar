@@ -1,0 +1,11 @@
+#ifndef SENSOR_H
+#define SENSOR_H
+
+extern const int qtrPins[8];
+
+void sensorSetup();
+void calibrateSensors();
+int getLinePosition();
+bool isAllBlack();
+
+#endif
