@@ -8,6 +8,7 @@ Adafruit_MPU6050 mpu;
 const int numSensors = 8;
 const int sensorPins[numSensors] = {26, 25, 33, 32, 35, 34, 39, 36};
 
+// Giữ nguyên ngưỡng bạn đang dùng
 const int thresholdValues[numSensors] = {3185, 3327, 3091, 3071,
                                          3192, 3113, 3450, 2787};
 
@@ -20,30 +21,49 @@ const int PWMB = 13;
 const int BIN1 = 5;
 const int BIN2 = 23;
 
-// Cascade PD + Gyro P
-float lineKp = 0.00145;
-float lineKd = 0.0042;
-float gyroKp = 64.0;
+// =====================================================
+// Smooth PD + Gyro Damping + Continuous Adaptive Speed
+// =====================================================
+// Error range khoảng -3500..3500
+// correction = Kp*error + Kd*dError - Kg*gyroZ
+// gyroZ đơn vị rad/s, dùng để hãm xoay quá đà.
+
+float lineKp = 0.070;       // tăng nếu xe vào cua thiếu, giảm nếu lắc mạnh
+float lineKd = 0.360;       // tăng nếu xe văng cua, giảm nếu bị giật
+float gyroDamping = 34.0;   // tăng nếu xe xoay tròn/quá đà, giảm nếu cua bị ì
 
 float gyroZOffset = 0.0;
 
 // Speed tuning
-int fullSpeed = 255;
-int fastSpeed = 255;
-int midSpeed = 235;
-int curveSpeed = 190;
-int searchSpeed = 125;
+int maxSpeed = 255;         // đường thẳng
+int minSpeed = 135;         // cua gắt vẫn giữ lực kéo
+int searchSpeed = 95;       // tìm line chậm để không xoay quá đà
 
-int currentSpeed = 170;
-int speedStepUp = 10;
-int speedStepDown = 22;
+int currentSpeed = 160;
+int speedStepUp = 7;        // tăng tốc mượt hơn
+int speedStepDown = 35;     // giảm tốc nhanh khi gặp cua
+
+// Giảm tốc liên tục theo error, đạo hàm và gyro
+float curveErrorGain = 0.030;   // giảm tốc theo độ lệch line
+float curveDGian = 0.018;       // giảm tốc theo tốc độ biến thiên error
+float curveGyroGain = 18.0;     // giảm tốc khi xe đang xoay nhanh
+
+// Giới hạn correction theo độ cua
+int softTurnLimit = 85;
+int midTurnLimit = 155;
+int hardTurnLimit = 225;
+
+// Lọc mượt error
+float filteredError = 0;
+float errorAlpha = 0.42;     // thấp hơn = mượt hơn, cao hơn = nhạy hơn
+
+// Lọc mượt derivative để bớt giật motor
+float filteredDerivative = 0;
+float derivativeAlpha = 0.35;
 
 int lastError = 0;
 bool lineDetected = false;
 bool sensorBlack[numSensors];
-
-float filteredError = 0;
-float errorAlpha = 0.45;
 
 void setupMotors() {
   pinMode(AIN1, OUTPUT);
@@ -103,12 +123,10 @@ void setMotorRight(int speed) {
 void rampSpeedTo(int targetSpeed) {
   if (currentSpeed < targetSpeed) {
     currentSpeed += speedStepUp;
-    if (currentSpeed > targetSpeed)
-      currentSpeed = targetSpeed;
+    if (currentSpeed > targetSpeed) currentSpeed = targetSpeed;
   } else if (currentSpeed > targetSpeed) {
     currentSpeed -= speedStepDown;
-    if (currentSpeed < targetSpeed)
-      currentSpeed = targetSpeed;
+    if (currentSpeed < targetSpeed) currentSpeed = targetSpeed;
   }
 }
 
@@ -134,7 +152,6 @@ void calibrateGyro() {
 float readGyroZ() {
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
-
   return gyro.gyro.z - gyroZOffset; // rad/s
 }
 
@@ -163,27 +180,10 @@ int readLineError() {
   return lastError;
 }
 
-int getTargetSpeed(int absError) {
-  bool centerLine = sensorBlack[3] && sensorBlack[4];
-
-  if (centerLine && absError < 600) {
-    return fullSpeed;
-  }
-
-  if (absError < 1100) {
-    return fastSpeed;
-  }
-
-  if (absError < 2400) {
-    return midSpeed;
-  }
-
-  return curveSpeed;
-}
-
 void searchLine() {
   currentSpeed = searchSpeed;
 
+  // Dùng hướng lệch cuối cùng để tìm lại line, không đổi hướng liên tục
   if (lastError > 0) {
     setMotorLeft(searchSpeed);
     setMotorRight(-searchSpeed);
@@ -191,11 +191,9 @@ void searchLine() {
     setMotorLeft(-searchSpeed);
     setMotorRight(searchSpeed);
   }
-
-  delay(18);
 }
 
-void followLineCascade() {
+void followLineSmoothGyro() {
   int rawError = readLineError();
 
   if (!lineDetected) {
@@ -203,39 +201,45 @@ void followLineCascade() {
     return;
   }
 
+  // Lọc error để xe không giật theo nhiễu analog
   filteredError = filteredError * (1.0 - errorAlpha) + rawError * errorAlpha;
-  int error = filteredError;
+  int error = (int)filteredError;
 
-  int derivative = error - lastError;
-  int absError = abs(error);
+  int rawDerivative = error - lastError;
+  filteredDerivative = filteredDerivative * (1.0 - derivativeAlpha) + rawDerivative * derivativeAlpha;
+  float dError = filteredDerivative;
 
   float gyroZ = readGyroZ();
 
-  float targetTurnRate = lineKp * error + lineKd * derivative;
-  targetTurnRate = constrain(targetTurnRate, -3.8, 3.8);
+  // PD bám line + gyro damping chống xoay quá đà
+  float correctionFloat = lineKp * error + lineKd * dError - gyroDamping * gyroZ;
+  int correction = (int)correctionFloat;
 
-  // Giữ dấu này vì xe bạn đã chạy mượt với dấu +
-  float turnError = targetTurnRate + gyroZ;
+  int absError = abs(error);
 
-  int correction = gyroKp * turnError;
-
-  if (absError < 700) {
-    correction = constrain(correction, -100, 100);
-  } else if (absError < 1800) {
-    correction = constrain(correction, -175, 175);
+  if (absError < 650) {
+    correction = constrain(correction, -softTurnLimit, softTurnLimit);
+  } else if (absError < 1700) {
+    correction = constrain(correction, -midTurnLimit, midTurnLimit);
   } else {
-    correction = constrain(correction, -230, 230);
+    correction = constrain(correction, -hardTurnLimit, hardTurnLimit);
   }
 
-  int targetSpeed = getTargetSpeed(absError);
+  // Tốc độ giảm mượt theo độ cua, tốc độ đổi hướng và tốc độ xoay thật
+  int targetSpeed = maxSpeed
+                    - (int)(curveErrorGain * absError)
+                    - (int)(curveDGian * abs(dError))
+                    - (int)(curveGyroGain * abs(gyroZ));
+
+  targetSpeed = constrain(targetSpeed, minSpeed, maxSpeed);
   rampSpeedTo(targetSpeed);
 
   int leftSpeed = currentSpeed + correction;
   int rightSpeed = currentSpeed - correction;
 
-  // Active Braking: bánh trong được phép phanh nhẹ ở cua gắt
-  leftSpeed = constrain(leftSpeed, -80, 255);
-  rightSpeed = constrain(rightSpeed, -80, 255);
+  // Cho phép active braking nhẹ khi cua rất gắt, nhưng không quá sâu để tránh xoay tròn
+  leftSpeed = constrain(leftSpeed, -95, 255);
+  rightSpeed = constrain(rightSpeed, -95, 255);
 
   setMotorLeft(leftSpeed);
   setMotorRight(rightSpeed);
@@ -248,18 +252,18 @@ void setup() {
   delay(1000);
 
   Wire.begin(21, 22);
+  Wire.setClock(400000);
 
   if (!mpu.begin(0x68, &Wire)) {
     Serial.println("MPU6050 NOT FOUND!");
-    while (1)
-      delay(100);
+    while (1) delay(100);
   }
 
   Serial.println("MPU6050 CONNECTED!");
 
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  mpu.setFilterBandwidth(MPU6050_BAND_44_HZ); // nhanh hơn 21Hz nhưng vẫn lọc nhiễu tốt
 
   for (int i = 0; i < numSensors; i++) {
     pinMode(sensorPins[i], INPUT);
@@ -268,8 +272,10 @@ void setup() {
   setupMotors();
   calibrateGyro();
 
-  Serial.println("START LINE FOLLOWING CASCADE FAST");
+  Serial.println("START SMOOTH PD + GYRO DAMPING + ADAPTIVE SPEED");
   delay(500);
 }
 
-void loop() { followLineCascade(); }
+void loop() {
+  followLineSmoothGyro();
+}
