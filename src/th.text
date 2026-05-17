@@ -21,29 +21,29 @@ const int BIN1 = 5;
 const int BIN2 = 23;
 
 // Cascade PD + Gyro P
-float lineKp = 0.00185;
-float lineKd = 0.0052;
-float gyroKp = 72.0;
+float lineKp = 0.00145;
+float lineKd = 0.0042;
+float gyroKp = 64.0;
 
 float gyroZOffset = 0.0;
 
 // Speed tuning
 int fullSpeed = 255;
 int fastSpeed = 255;
-int midSpeed = 240;
-int curveSpeed = 180;
-int searchSpeed = 150;
+int midSpeed = 235;
+int curveSpeed = 190;
+int searchSpeed = 125;
 
-int currentSpeed = 200;
-int speedStepUp = 25;
-int speedStepDown = 60;
+int currentSpeed = 170;
+int speedStepUp = 10;
+int speedStepDown = 22;
 
 int lastError = 0;
 bool lineDetected = false;
 bool sensorBlack[numSensors];
 
 float filteredError = 0;
-float errorAlpha = 0.60;
+float errorAlpha = 0.45;
 
 void setupMotors() {
   pinMode(AIN1, OUTPUT);
@@ -134,7 +134,8 @@ void calibrateGyro() {
 float readGyroZ() {
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
-  return gyro.gyro.z - gyroZOffset;
+
+  return gyro.gyro.z - gyroZOffset; // rad/s
 }
 
 int readLineError() {
@@ -165,12 +166,18 @@ int readLineError() {
 int getTargetSpeed(int absError) {
   bool centerLine = sensorBlack[3] && sensorBlack[4];
 
-  if (centerLine && absError < 700)
+  if (centerLine && absError < 600) {
     return fullSpeed;
-  if (absError < 1300)
+  }
+
+  if (absError < 1100) {
     return fastSpeed;
-  if (absError < 2300)
+  }
+
+  if (absError < 2400) {
     return midSpeed;
+  }
+
   return curveSpeed;
 }
 
@@ -184,6 +191,8 @@ void searchLine() {
     setMotorLeft(-searchSpeed);
     setMotorRight(searchSpeed);
   }
+
+  delay(18);
 }
 
 void followLineCascade() {
@@ -203,18 +212,19 @@ void followLineCascade() {
   float gyroZ = readGyroZ();
 
   float targetTurnRate = lineKp * error + lineKd * derivative;
-  targetTurnRate = constrain(targetTurnRate, -5.2, 5.2);
+  targetTurnRate = constrain(targetTurnRate, -3.8, 3.8);
 
+  // Giữ dấu này vì xe bạn đã chạy mượt với dấu +
   float turnError = targetTurnRate + gyroZ;
 
   int correction = gyroKp * turnError;
 
   if (absError < 700) {
-    correction = constrain(correction, -120, 120);
+    correction = constrain(correction, -100, 100);
   } else if (absError < 1800) {
-    correction = constrain(correction, -220, 220);
+    correction = constrain(correction, -175, 175);
   } else {
-    correction = constrain(correction, -255, 255);
+    correction = constrain(correction, -230, 230);
   }
 
   int targetSpeed = getTargetSpeed(absError);
@@ -223,8 +233,9 @@ void followLineCascade() {
   int leftSpeed = currentSpeed + correction;
   int rightSpeed = currentSpeed - correction;
 
-  leftSpeed = constrain(leftSpeed, 0, 255);
-  rightSpeed = constrain(rightSpeed, 0, 255);
+  // Active Braking: bánh trong được phép phanh nhẹ ở cua gắt
+  leftSpeed = constrain(leftSpeed, -80, 255);
+  rightSpeed = constrain(rightSpeed, -80, 255);
 
   setMotorLeft(leftSpeed);
   setMotorRight(rightSpeed);
@@ -257,7 +268,8 @@ void setup() {
   setupMotors();
   calibrateGyro();
 
-  Serial.println("START FAST NO-DELAY CASCADE");
+  Serial.println("START LINE FOLLOWING CASCADE FAST");
+  delay(500);
 }
 
 void loop() { followLineCascade(); }

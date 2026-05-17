@@ -1,275 +1,256 @@
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Arduino.h>
-#include <Wire.h>
+#include <Arduino.h>   // BẮT BUỘC CÓ KHI DÙNG VS CODE
+#include <Bluepad32.h> // Thư viện đọc tay cầm
 
-Adafruit_MPU6050 mpu;
+ControllerPtr tayCam = nullptr; // Khai báo tên tay cầm
 
-const int numSensors = 8;
-const int sensorPins[numSensors] = {26, 25, 33, 32, 35, 34, 39, 36};
+// --- SƠ ĐỒ CHÂN THEO ĐÚNG ĐẤU NỐI THỰC TẾ ---
+int IN1 = 27;
+int IN2 = 26;
+int ENA = 14; // OUT1 & OUT2 -> Cụm bánh TRÁI (Đỏ OUT1, Đen OUT2)
 
-const int thresholdValues[numSensors] = {3185, 3327, 3091, 3071,
-                                         3192, 3113, 3450, 2787};
+int IN3 = 25;
+int IN4 = 33;
+int ENB = 32; // OUT3 & OUT4 -> Cụm bánh PHẢI (Đỏ OUT3, Đen OUT4)
 
-// TB6612FNG
-const int PWMA = 27;
-const int AIN1 = 18;
-const int AIN2 = 19;
+// KHAI BÁO TRƯỚC CÁC HÀM DI CHUYỂN (Dành cho VS Code/C++ chuẩn)
+void diChuyenTien(int tocDo);
+void diChuyenLui(int tocDo);
+void quayTrai(int tocDo);
+void quayPhai(int tocDo);
+void dungLai();
+void inLogTayCam(ControllerPtr ctl);
+void setMotorLeft(int speed);
+void setMotorRight(int speed);
 
-const int PWMB = 13;
-const int BIN1 = 5;
-const int BIN2 = 23;
-
-// Cascade PD + Gyro P
-float lineKp = 0.00145;
-float lineKd = 0.0042;
-float gyroKp = 64.0;
-
-float gyroZOffset = 0.0;
-
-// Speed tuning
-int fullSpeed = 255;
-int fastSpeed = 255;
-int midSpeed = 235;
-int curveSpeed = 190;
-int searchSpeed = 125;
-
-int currentSpeed = 170;
-int speedStepUp = 10;
-int speedStepDown = 22;
-
-int lastError = 0;
-bool lineDetected = false;
-bool sensorBlack[numSensors];
-
-float filteredError = 0;
-float errorAlpha = 0.45;
-
-void setupMotors() {
-  pinMode(AIN1, OUTPUT);
-  pinMode(AIN2, OUTPUT);
-  pinMode(BIN1, OUTPUT);
-  pinMode(BIN2, OUTPUT);
-
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  pinMode(PWMA, OUTPUT);
-  pinMode(PWMB, OUTPUT);
-#else
-  ledcSetup(0, 5000, 8);
-  ledcAttachPin(PWMA, 0);
-  ledcSetup(1, 5000, 8);
-  ledcAttachPin(PWMB, 1);
-#endif
-}
-
-void setMotorLeft(int speed) {
-  speed = constrain(speed, -255, 255);
-
-  if (speed >= 0) {
-    digitalWrite(BIN1, HIGH);
-    digitalWrite(BIN2, LOW);
-  } else {
-    digitalWrite(BIN1, LOW);
-    digitalWrite(BIN2, HIGH);
-    speed = -speed;
-  }
-
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  analogWrite(PWMB, speed);
-#else
-  ledcWrite(1, speed);
-#endif
-}
-
-void setMotorRight(int speed) {
-  speed = constrain(speed, -255, 255);
-
-  if (speed >= 0) {
-    digitalWrite(AIN1, HIGH);
-    digitalWrite(AIN2, LOW);
-  } else {
-    digitalWrite(AIN1, LOW);
-    digitalWrite(AIN2, HIGH);
-    speed = -speed;
-  }
-
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  analogWrite(PWMA, speed);
-#else
-  ledcWrite(0, speed);
-#endif
-}
-
-void rampSpeedTo(int targetSpeed) {
-  if (currentSpeed < targetSpeed) {
-    currentSpeed += speedStepUp;
-    if (currentSpeed > targetSpeed)
-      currentSpeed = targetSpeed;
-  } else if (currentSpeed > targetSpeed) {
-    currentSpeed -= speedStepDown;
-    if (currentSpeed < targetSpeed)
-      currentSpeed = targetSpeed;
+// Hàm tự động chạy khi tay cầm kết nối
+void onConnectedController(ControllerPtr ctl) {
+  if (tayCam == nullptr) {
+    tayCam = ctl;
+    Serial.println("Đã kết nối tay cầm thành công!");
   }
 }
 
-void calibrateGyro() {
-  Serial.println("Calibrating gyro... keep robot still");
-
-  sensors_event_t accel, gyro, temp;
-  float sum = 0;
-  const int samples = 500;
-
-  for (int i = 0; i < samples; i++) {
-    mpu.getEvent(&accel, &gyro, &temp);
-    sum += gyro.gyro.z;
-    delay(2);
+// Hàm tự động chạy khi tay cầm ngắt kết nối
+void onDisconnectedController(ControllerPtr ctl) {
+  if (tayCam == ctl) {
+    tayCam = nullptr;
+    Serial.println("Tay cầm đã ngắt kết nối!");
+    dungLai(); // Xe tự phanh lại cho an toàn
   }
-
-  gyroZOffset = sum / samples;
-
-  Serial.print("gyroZOffset = ");
-  Serial.println(gyroZOffset, 6);
-}
-
-float readGyroZ() {
-  sensors_event_t accel, gyro, temp;
-  mpu.getEvent(&accel, &gyro, &temp);
-
-  return gyro.gyro.z - gyroZOffset; // rad/s
-}
-
-int readLineError() {
-  long weightedSum = 0;
-  int activeCount = 0;
-
-  for (int i = 0; i < numSensors; i++) {
-    int value = analogRead(sensorPins[i]);
-    sensorBlack[i] = value < thresholdValues[i];
-
-    if (sensorBlack[i]) {
-      int reversedIndex = numSensors - 1 - i;
-      weightedSum += reversedIndex * 1000;
-      activeCount++;
-    }
-  }
-
-  lineDetected = activeCount > 0;
-
-  if (lineDetected) {
-    int position = weightedSum / activeCount;
-    return position - 3500;
-  }
-
-  return lastError;
-}
-
-int getTargetSpeed(int absError) {
-  bool centerLine = sensorBlack[3] && sensorBlack[4];
-
-  if (centerLine && absError < 600) {
-    return fullSpeed;
-  }
-
-  if (absError < 1100) {
-    return fastSpeed;
-  }
-
-  if (absError < 2400) {
-    return midSpeed;
-  }
-
-  return curveSpeed;
-}
-
-void searchLine() {
-  currentSpeed = searchSpeed;
-
-  if (lastError > 0) {
-    setMotorLeft(searchSpeed);
-    setMotorRight(-searchSpeed);
-  } else {
-    setMotorLeft(-searchSpeed);
-    setMotorRight(searchSpeed);
-  }
-
-  delay(18);
-}
-
-void followLineCascade() {
-  int rawError = readLineError();
-
-  if (!lineDetected) {
-    searchLine();
-    return;
-  }
-
-  filteredError = filteredError * (1.0 - errorAlpha) + rawError * errorAlpha;
-  int error = filteredError;
-
-  int derivative = error - lastError;
-  int absError = abs(error);
-
-  float gyroZ = readGyroZ();
-
-  float targetTurnRate = lineKp * error + lineKd * derivative;
-  targetTurnRate = constrain(targetTurnRate, -3.8, 3.8);
-
-  // Giữ dấu này vì xe bạn đã chạy mượt với dấu +
-  float turnError = targetTurnRate + gyroZ;
-
-  int correction = gyroKp * turnError;
-
-  if (absError < 700) {
-    correction = constrain(correction, -100, 100);
-  } else if (absError < 1800) {
-    correction = constrain(correction, -175, 175);
-  } else {
-    correction = constrain(correction, -230, 230);
-  }
-
-  int targetSpeed = getTargetSpeed(absError);
-  rampSpeedTo(targetSpeed);
-
-  int leftSpeed = currentSpeed + correction;
-  int rightSpeed = currentSpeed - correction;
-
-  // Active Braking: bánh trong được phép phanh nhẹ ở cua gắt
-  leftSpeed = constrain(leftSpeed, -80, 255);
-  rightSpeed = constrain(rightSpeed, -80, 255);
-
-  setMotorLeft(leftSpeed);
-  setMotorRight(rightSpeed);
-
-  lastError = error;
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
 
-  Wire.begin(21, 22);
+  // Khởi tạo các chân là đầu ra lệnh (OUTPUT)
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
 
-  if (!mpu.begin(0x68, &Wire)) {
-    Serial.println("MPU6050 NOT FOUND!");
-    while (1)
-      delay(100);
-  }
+  // Ép các chân về 0V ngay lập tức để khóa động cơ, chống nhiễu
+  digitalWrite(ENA, LOW);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(ENB, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
 
-  Serial.println("MPU6050 CONNECTED!");
-
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-
-  for (int i = 0; i < numSensors; i++) {
-    pinMode(sensorPins[i], INPUT);
-  }
-
-  setupMotors();
-  calibrateGyro();
-
-  Serial.println("START LINE FOLLOWING CASCADE FAST");
-  delay(500);
+  // Khởi động trạm thu phát Bluetooth chờ tay cầm
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+  Serial.println("Hệ thống đã sẵn sàng! Đang tìm kiếm tay cầm...");
 }
 
-void loop() { followLineCascade(); }
+void loop() {
+  // Cập nhật liên tục trạng thái tay cầm
+  BP32.update();
+
+  if (tayCam && tayCam->isConnected()) {
+    // In tín hiệu tay cầm ra màn hình Serial Monitor
+    // inLogTayCam(tayCam);
+
+    // 1. ĐỌC PHÍM CHỮ THẬP (D-PAD)
+    if (tayCam->dpad() == DPAD_UP) {
+      diChuyenTien(250);
+    } else if (tayCam->dpad() == DPAD_DOWN) {
+      diChuyenLui(250);
+    } else if (tayCam->dpad() == DPAD_LEFT) {
+      quayTrai(200);
+    } else if (tayCam->dpad() == DPAD_RIGHT) {
+      quayPhai(200);
+    }
+
+    else {
+      // 2. ĐIỀU KHIỂN TRƠN TRU CẦN JOYSTICK TRÁI (ANALOG CONTROL)
+      // trucY: -512 (Đẩy lên / Tiến) -> 511 (Kéo xuống / Lùi)
+      // trucX: -512 (Gạt trái / Rẽ trái) -> 511 (Gạt phải / Rẽ phải)
+      int trucY = tayCam->axisY();
+      int trucX = tayCam->axisX();
+
+      // Vùng chết (Deadzone) để tránh xe tự trôi khi không chạm cần
+      int deadzone = 40;
+      if (abs(trucY) < deadzone) trucY = 0;
+      if (abs(trucX) < deadzone) trucX = 0;
+
+      if (trucY == 0 && trucX == 0) {
+        dungLai();
+        // Log trạng thái dừng xe khi thả cần Joystick (mỗi 1 giây in một lần để tránh spam)
+        static unsigned long lastStopLog = 0;
+        if (millis() - lastStopLog >= 1000) {
+          lastStopLog = millis();
+          Serial.println("[DONG CO LOG] XE DUNG (Không chạm Joystick)");
+        }
+      } else {
+        // Đảo chiều Y vì đẩy lên (Forward) có giá trị âm (-512)
+        float throttle = -trucY; 
+        float steering = trucX;
+
+        // Quy đổi từ dải [-512, 512] của Joystick sang dải PWM [-255, 255]
+        float v_throttle = (throttle / 512.0) * 255.0;
+        float v_steering = (steering / 512.0) * 255.0;
+
+        // Trộn kênh vi sai (Differential Steering) để rẽ trơn tru
+        float leftSpeed = v_throttle + v_steering;
+        float rightSpeed = v_throttle - v_steering;
+
+        // Giới hạn tốc độ trong khoảng [-255, 255]
+        int speedL = constrain((int)leftSpeed, -255, 255);
+        int speedR = constrain((int)rightSpeed, -255, 255);
+
+        // Phát xung điều khiển độc lập hai cụm động cơ
+        setMotorLeft(speedL);
+        setMotorRight(speedR);
+
+        // In log hướng motor và tốc độ ra Serial (mỗi 200ms)
+        static unsigned long lastMotorLog = 0;
+        if (millis() - lastMotorLog >= 200) {
+          lastMotorLog = millis();
+          
+          String dirL = (speedL > 0) ? "TIEN" : ((speedL < 0) ? "LUI" : "DUNG");
+          String dirR = (speedR > 0) ? "TIEN" : ((speedR < 0) ? "LUI" : "DUNG");
+          
+          Serial.printf("[DONG CO LOG] JoyL: (X=%d, Y=%d) | Bánh TRÁI: %s (PWM=%d) | Bánh PHẢI: %s (PWM=%d)\n",
+                        trucX, trucY, dirL.c_str(), abs(speedL), dirR.c_str(), abs(speedR));
+        }
+      }
+    }
+  }
+  delay(10); // Nghỉ 10 mili-giây cho hệ thống mượt mà
+}
+
+// --- CÁC HÀM XỬ LÝ DI CHUYỂN ---
+void diChuyenTien(int tocDo) {
+  Serial.println("tien");
+  setMotorLeft(tocDo);
+  setMotorRight(tocDo);
+}
+void diChuyenLui(int tocDo) {
+  Serial.println("lui");
+
+  setMotorLeft(-tocDo);
+  setMotorRight(-tocDo);
+}
+void quayTrai(int tocDo) {
+  Serial.println("trai");
+
+  setMotorLeft(-tocDo); // Quay xe tại chỗ trái: trái lùi, phải tiến
+  setMotorRight(tocDo);
+}
+void quayPhai(int tocDo) {
+  Serial.println("phai");
+
+  setMotorLeft(tocDo);  // Quay xe tại chỗ phải: trái tiến, phải lùi
+  setMotorRight(-tocDo);
+}
+void dungLai() {
+  setMotorLeft(0);
+  setMotorRight(0);
+}
+
+// Hàm in log các tín hiệu từ tay cầm ra Serial để theo dõi
+void inLogTayCam(ControllerPtr ctl) {
+  // Giới hạn tần suất in log để tránh tràn Serial (mỗi 250ms in 1 lần)
+  static unsigned long lastLogTime = 0;
+  if (millis() - lastLogTime < 250) {
+    return;
+  }
+  lastLogTime = millis();
+
+  // 1. Đọc các trục Joystick (khoảng -512 đến 511)
+  int lx = ctl->axisX();
+  int ly = ctl->axisY();
+  int rx = ctl->axisRX();
+  int ry = ctl->axisRY();
+
+  // 2. Đọc cò (phanh và ga) (khoảng 0 đến 1023)
+  int phanh = ctl->brake();
+  int ga = ctl->throttle();
+
+  // 3. Đọc D-Pad (Phím chữ thập)
+  int dpad = ctl->dpad();
+  String dpadStr = "";
+  if (dpad & DPAD_UP) dpadStr += "LEN ";
+  if (dpad & DPAD_DOWN) dpadStr += "XUONG ";
+  if (dpad & DPAD_LEFT) dpadStr += "TRAI ";
+  if (dpad & DPAD_RIGHT) dpadStr += "PHAI ";
+  if (dpadStr == "") dpadStr = "KHONG";
+
+  // 4. Đọc các nút bấm chính
+  String nutStr = "";
+  if (ctl->a()) nutStr += "A ";
+  if (ctl->b()) nutStr += "B ";
+  if (ctl->x()) nutStr += "X ";
+  if (ctl->y()) nutStr += "Y ";
+  if (ctl->l1()) nutStr += "L1 ";
+  if (ctl->r1()) nutStr += "R1 ";
+  if (nutStr == "") nutStr = "KHONG";
+
+  // 5. In ra màn hình Serial Monitor với định dạng dễ đọc
+  Serial.print("[LOG TAY CAM] ");
+  Serial.print("JoyL: (X="); Serial.print(lx); Serial.print(", Y="); Serial.print(ly); Serial.print(") | ");
+  Serial.print("JoyR: (X="); Serial.print(rx); Serial.print(", Y="); Serial.print(ry); Serial.print(") | ");
+  Serial.print("Dpad: "); Serial.print(dpadStr); Serial.print(" | ");
+  Serial.print("Nút: "); Serial.print(nutStr); Serial.print(" | ");
+  Serial.print("Cò Trái: "); Serial.print(phanh); Serial.print(" | ");
+  Serial.print("Cò Phải: "); Serial.println(ga);
+}
+
+// Hàm điều khiển bánh bên trái (Cho phép chạy cả Tiến & Lùi trơn tru)
+// Đấu nối: Đỏ nối OUT1, Đen nối OUT2 -> Điều khiển bằng IN1, IN2, ENA
+void setMotorLeft(int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, speed);
+  } else if (speed < 0) {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    analogWrite(ENA, -speed);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, 0);
+  }
+}
+
+// Hàm điều khiển bánh bên phải (Cho phép chạy cả Tiến & Lùi trơn tru)
+// Đấu nối: Đỏ nối OUT3, Đen nối OUT4 -> Điều khiển bằng IN3, IN4, ENB
+void setMotorRight(int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, speed);
+  } else if (speed < 0) {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    analogWrite(ENB, -speed);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, 0);
+  }
+}
