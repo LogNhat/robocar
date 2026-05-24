@@ -1,275 +1,273 @@
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 #include <Arduino.h>
-#include <Wire.h>
 
-Adafruit_MPU6050 mpu;
+// ================= PIN =================
 
-const int numSensors = 8;
-const int sensorPins[numSensors] = {26, 25, 33, 32, 35, 34, 39, 36};
+// QTR-8A: mắt đang lắp ngược
+const int sensorPins[8] = {36, 39, 34, 35, 32, 33, 25, 26};
 
-const int thresholdValues[numSensors] = {3185, 3327, 3091, 3071,
-                                         3192, 3113, 3450, 2787};
+int thresholds[8] = {2953, 3545, 3268, 3368, 3223, 3275, 3452, 3265};
 
-// TB6612FNG
-const int PWMA = 27;
-const int AIN1 = 18;
-const int AIN2 = 19;
+const int weights[8] = {0, 1000, 2000, 3000, 4000, 5000, 6000, 7000};
 
-const int PWMB = 13;
-const int BIN1 = 5;
-const int BIN2 = 23;
+// TB6612
+#define PWMA 27
+#define AIN1 18
+#define AIN2 19
 
-// Cascade PD + Gyro P
-float lineKp = 0.00145;
-float lineKd = 0.0042;
-float gyroKp = 64.0;
+#define PWMB 13
+#define BIN1 5
+#define BIN2 23
 
-float gyroZOffset = 0.0;
+// Tắt laser
+#define XSHUT_LEFT 15
+#define XSHUT_FRONT 16
+#define XSHUT_RIGHT 17
 
-// Speed tuning
-int fullSpeed = 255;
-int fastSpeed = 255;
-int midSpeed = 235;
-int curveSpeed = 190;
-int searchSpeed = 125;
+// ================= DEBUG =================
 
-int currentSpeed = 170;
-int speedStepUp = 10;
-int speedStepDown = 22;
+#define DEBUG 0 // 0 = chạy nhanh, 1 = in Serial để tune
+
+// ================= THÔNG SỐ TINH CHỈNH =================
+
+// Dùng integer cho nhanh
+// Kp = 35 nghĩa là 0.035
+// Kd = 80 nghĩa là 0.080
+int Kp = 40;
+int Kd = 80;
+
+int maxCorrection = 130;
+
+// tốc độ
+int SPEED_MAX = 130;
+int SPEED_FAST = 120;
+int SPEED_MID = 110;
+int SPEED_CURVE = 100;
+int SPEED_SEARCH = 90;
+
+// ================= BIẾN =================
 
 int lastError = 0;
-bool lineDetected = false;
-bool sensorBlack[numSensors];
+int currentSpeed = 100;
+int lastDirection = 1;
 
-float filteredError = 0;
-float errorAlpha = 0.45;
+// ================= MOTOR =================
 
-void setupMotors() {
-  pinMode(AIN1, OUTPUT);
-  pinMode(AIN2, OUTPUT);
-  pinMode(BIN1, OUTPUT);
-  pinMode(BIN2, OUTPUT);
-
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  pinMode(PWMA, OUTPUT);
-  pinMode(PWMB, OUTPUT);
-#else
-  ledcSetup(0, 5000, 8);
-  ledcAttachPin(PWMA, 0);
-  ledcSetup(1, 5000, 8);
-  ledcAttachPin(PWMB, 1);
-#endif
-}
-
-void setMotorLeft(int speed) {
+void motorLeft(int speed) {
   speed = constrain(speed, -255, 255);
 
   if (speed >= 0) {
     digitalWrite(BIN1, HIGH);
     digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, speed);
   } else {
     digitalWrite(BIN1, LOW);
     digitalWrite(BIN2, HIGH);
-    speed = -speed;
+    analogWrite(PWMB, -speed);
   }
-
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  analogWrite(PWMB, speed);
-#else
-  ledcWrite(1, speed);
-#endif
 }
 
-void setMotorRight(int speed) {
+void motorRight(int speed) {
   speed = constrain(speed, -255, 255);
 
   if (speed >= 0) {
     digitalWrite(AIN1, HIGH);
     digitalWrite(AIN2, LOW);
+    analogWrite(PWMA, speed);
   } else {
     digitalWrite(AIN1, LOW);
     digitalWrite(AIN2, HIGH);
-    speed = -speed;
-  }
-
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  analogWrite(PWMA, speed);
-#else
-  ledcWrite(0, speed);
-#endif
-}
-
-void rampSpeedTo(int targetSpeed) {
-  if (currentSpeed < targetSpeed) {
-    currentSpeed += speedStepUp;
-    if (currentSpeed > targetSpeed)
-      currentSpeed = targetSpeed;
-  } else if (currentSpeed > targetSpeed) {
-    currentSpeed -= speedStepDown;
-    if (currentSpeed < targetSpeed)
-      currentSpeed = targetSpeed;
+    analogWrite(PWMA, -speed);
   }
 }
 
-void calibrateGyro() {
-  Serial.println("Calibrating gyro... keep robot still");
-
-  sensors_event_t accel, gyro, temp;
-  float sum = 0;
-  const int samples = 500;
-
-  for (int i = 0; i < samples; i++) {
-    mpu.getEvent(&accel, &gyro, &temp);
-    sum += gyro.gyro.z;
-    delay(2);
-  }
-
-  gyroZOffset = sum / samples;
-
-  Serial.print("gyroZOffset = ");
-  Serial.println(gyroZOffset, 6);
+void setMotors(int left, int right) {
+  motorLeft(left);
+  motorRight(right);
 }
 
-float readGyroZ() {
-  sensors_event_t accel, gyro, temp;
-  mpu.getEvent(&accel, &gyro, &temp);
+// ================= LINE SENSOR =================
 
-  return gyro.gyro.z - gyroZOffset; // rad/s
-}
-
-int readLineError() {
+int readLine(int &error) {
   long weightedSum = 0;
   int activeCount = 0;
 
-  for (int i = 0; i < numSensors; i++) {
-    int value = analogRead(sensorPins[i]);
-    sensorBlack[i] = value < thresholdValues[i];
+  for (int i = 0; i < 8; i++) {
+    int raw = analogRead(sensorPins[i]);
 
-    if (sensorBlack[i]) {
-      int reversedIndex = numSensors - 1 - i;
-      weightedSum += reversedIndex * 1000;
+    // raw < threshold => thấy line đen
+    if (raw < thresholds[i]) {
+      weightedSum += weights[i];
       activeCount++;
     }
   }
 
-  lineDetected = activeCount > 0;
+  if (activeCount == 0)
+    return 0; // Mất line (cả 8 mắt đều thấy trắng)
+    
+  if (activeCount == 8) // CHỈ khi đủ 8 mắt đều thấy đen thì mới coi là vạch đích
+    return 2; // Vạch đích
 
-  if (lineDetected) {
-    int position = weightedSum / activeCount;
-    return position - 3500;
-  }
+  int position = weightedSum / activeCount;
 
-  return lastError;
+  // Sensor mắt lắp ngược
+  error = 3500 - position;
+
+  if (error > 50)
+    lastDirection = 1;
+  else if (error < -50)
+    lastDirection = -1;
+
+  return 1; // Đang bám line bình thường
 }
 
-int getTargetSpeed(int absError) {
-  bool centerLine = sensorBlack[3] && sensorBlack[4];
+// ================= SPEED =================
 
-  if (centerLine && absError < 600) {
-    return fullSpeed;
-  }
+int chooseTargetSpeed(int error) {
+  int e = abs(error);
 
-  if (absError < 1100) {
-    return fastSpeed;
-  }
+  if (e < 400)
+    return SPEED_MAX;
+  if (e < 1000)
+    return SPEED_FAST;
+  if (e < 2200)
+    return SPEED_MID;
 
-  if (absError < 2400) {
-    return midSpeed;
-  }
-
-  return curveSpeed;
+  return SPEED_CURVE;
 }
 
-void searchLine() {
-  currentSpeed = searchSpeed;
+// Không ramp để phản ứng nhanh nhất
+void updateSpeed(int targetSpeed) { currentSpeed = targetSpeed; }
 
-  if (lastError > 0) {
-    setMotorLeft(searchSpeed);
-    setMotorRight(-searchSpeed);
-  } else {
-    setMotorLeft(-searchSpeed);
-    setMotorRight(searchSpeed);
+// ================= PD =================
+
+void followLine() {
+  int error = 0;
+  int lineStatus = readLine(error);
+
+  // Vạch đích (cả 8 mắt đều đen): Dừng hẳn
+  if (lineStatus == 2) {
+    setMotors(-currentSpeed, -currentSpeed); // Phanh nhẹ trước khi dừng hẳn
+    delay(30);
+    setMotors(0, 0);
+    
+    Serial.println("=== FINISH LINE DETECTED - STOPPED ===");
+    while (true) {
+      setMotors(0, 0); // Khóa xe dừng vĩnh viễn ở đây
+      delay(100);
+    }
   }
 
-  delay(18);
-}
+  static bool wasOnLine = true;
 
-void followLineCascade() {
-  int rawError = readLineError();
+  // Mất line: hãm phanh và xoay tìm lại NGAY LẬP TỨC
+  if (lineStatus == 0) {
+    if (wasOnLine) {
+      // Phanh phản lực cực gắt để dập quán tính trong 15ms
+      setMotors(-255, -255);
+      delay(15); 
+      
+      wasOnLine = false;
+    }
 
-  if (!lineDetected) {
-    searchLine();
+    currentSpeed = SPEED_SEARCH;
+
+    // Phản xạ xoay ngay lập tức không có độ trễ
+    if (lastDirection > 0) {
+      setMotors(-SPEED_SEARCH, SPEED_SEARCH);
+    } else {
+      setMotors(SPEED_SEARCH, -SPEED_SEARCH);
+    }
+
     return;
   }
 
-  filteredError = filteredError * (1.0 - errorAlpha) + rawError * errorAlpha;
-  int error = filteredError;
+  wasOnLine = true;
 
-  int derivative = error - lastError;
-  int absError = abs(error);
+  int dError = error - lastError;
 
-  float gyroZ = readGyroZ();
+  // PD integer:
+  // Kp=35, Kd=80 tương đương 0.035 và 0.080
+  int correction = (Kp * error + Kd * dError) / 1000;
 
-  float targetTurnRate = lineKp * error + lineKd * derivative;
-  targetTurnRate = constrain(targetTurnRate, -3.8, 3.8);
+  correction = constrain(correction, -maxCorrection, maxCorrection);
 
-  // Giữ dấu này vì xe bạn đã chạy mượt với dấu +
-  float turnError = targetTurnRate + gyroZ;
+  int targetSpeed = chooseTargetSpeed(error);
+  updateSpeed(targetSpeed);
 
-  int correction = gyroKp * turnError;
+  int leftSpeed = currentSpeed - correction;
+  int rightSpeed = currentSpeed + correction;
 
-  if (absError < 700) {
-    correction = constrain(correction, -100, 100);
-  } else if (absError < 1800) {
-    correction = constrain(correction, -175, 175);
-  } else {
-    correction = constrain(correction, -230, 230);
-  }
+  leftSpeed = constrain(leftSpeed, 0, 255);
+  rightSpeed = constrain(rightSpeed, 0, 255);
 
-  int targetSpeed = getTargetSpeed(absError);
-  rampSpeedTo(targetSpeed);
-
-  int leftSpeed = currentSpeed + correction;
-  int rightSpeed = currentSpeed - correction;
-
-  // Active Braking: bánh trong được phép phanh nhẹ ở cua gắt
-  leftSpeed = constrain(leftSpeed, -80, 255);
-  rightSpeed = constrain(rightSpeed, -80, 255);
-
-  setMotorLeft(leftSpeed);
-  setMotorRight(rightSpeed);
+  setMotors(leftSpeed, rightSpeed);
 
   lastError = error;
+
+#if DEBUG
+  static unsigned long lastLog = 0;
+  if (millis() - lastLog >= 200) {
+    lastLog = millis();
+
+    Serial.printf("Err:%5d | D:%5d | Corr:%4d | Spd:%3d | L:%3d | R:%3d\n",
+                  error, dError, correction, currentSpeed, leftSpeed,
+                  rightSpeed);
+  }
+#endif
 }
+
+// ================= SETUP =================
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(300);
 
-  Wire.begin(21, 22);
+  // ADC ESP32
+  analogSetWidth(12);
+  analogSetAttenuation(ADC_11db);
 
-  if (!mpu.begin(0x68, &Wire)) {
-    Serial.println("MPU6050 NOT FOUND!");
-    while (1)
-      delay(100);
-  }
+  // Tắt laser VL53L0X
+  pinMode(XSHUT_LEFT, OUTPUT);
+  pinMode(XSHUT_FRONT, OUTPUT);
+  pinMode(XSHUT_RIGHT, OUTPUT);
 
-  Serial.println("MPU6050 CONNECTED!");
+  digitalWrite(XSHUT_LEFT, LOW);
+  digitalWrite(XSHUT_FRONT, LOW);
+  digitalWrite(XSHUT_RIGHT, LOW);
 
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  // Motor
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
 
-  for (int i = 0; i < numSensors; i++) {
+  setMotors(0, 0);
+
+  // Sensor
+  for (int i = 0; i < 8; i++) {
     pinMode(sensorPins[i], INPUT);
   }
 
-  setupMotors();
-  calibrateGyro();
-
-  Serial.println("START LINE FOLLOWING CASCADE FAST");
-  delay(500);
+#if DEBUG
+  Serial.println("PD ULTRA FAST READY");
+#endif
 }
 
-void loop() { followLineCascade(); }
+// ================= LOOP =================
+
+void loop() {
+  // Gửi ký tự 'r' qua Serial Monitor để reset ESP32 từ xa
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'r' || c == 'R') {
+      Serial.println("=== SOFTWARE RESET ===");
+      setMotors(0, 0);
+      delay(100);
+      ESP.restart();
+    }
+  }
+
+  followLine();
+}

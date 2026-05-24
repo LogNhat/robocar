@@ -3,14 +3,14 @@
 
 ControllerPtr tayCam = nullptr; // Khai báo tên tay cầm
 
-// --- SƠ ĐỒ CHÂN BẠN ĐÃ THIẾT KẾ ---
-int IN1 = 27;
+// --- SƠ ĐỒ CHÂN THEO ĐÚNG ĐẤU NỐI THỰC TẾ ---
+int IN1 = 27; 
 int IN2 = 26;
-int ENA = 14; // Cụm bánh trái
+int ENA = 14; // OUT1 & OUT2 -> Cụm bánh TRÁI (Đỏ OUT1, Đen OUT2)
 
 int IN3 = 25;
 int IN4 = 33;
-int ENB = 32; // Cụm bánh phải
+int ENB = 32; // OUT3 & OUT4 -> Cụm bánh PHẢI (Đỏ OUT3, Đen OUT4)
 
 // KHAI BÁO TRƯỚC CÁC HÀM DI CHUYỂN (Dành cho VS Code/C++ chuẩn)
 void diChuyenTien(int tocDo);
@@ -18,6 +18,9 @@ void diChuyenLui(int tocDo);
 void quayTrai(int tocDo);
 void quayPhai(int tocDo);
 void dungLai();
+void inLogTayCam(ControllerPtr ctl);
+void setMotorLeft(int speed);
+void setMotorRight(int speed);
 
 // Hàm tự động chạy khi tay cầm kết nối
 void onConnectedController(ControllerPtr ctl) {
@@ -65,6 +68,8 @@ void loop() {
   BP32.update();
 
   if (tayCam && tayCam->isConnected()) {
+    // In tín hiệu tay cầm ra màn hình Serial Monitor
+    // inLogTayCam(tayCam);
 
     // 1. ĐỌC PHÍM CHỮ THẬP (D-PAD)
     if (tayCam->dpad() == DPAD_UP) {
@@ -78,26 +83,63 @@ void loop() {
     }
 
     else {
-      // 2. NẾU KHÔNG BẤM D-PAD -> ĐỌC CẦN GẠT JOYSTICK TRÁI
-      // Giá trị trục X, Y của Joystick chạy từ khoảng -511 đến 511
+      // 2. ĐIỀU KHIỂN TRƠN TRU CẦN JOYSTICK TRÁI (ANALOG CONTROL)
+      // trucY: -512 (Đẩy lên / Tiến) -> 511 (Kéo xuống / Lùi)
+      // trucX: -512 (Gạt trái / Rẽ trái) -> 511 (Gạt phải / Rẽ phải)
       int trucY = tayCam->axisY();
       int trucX = tayCam->axisX();
 
-      if (trucY <= -150) {
-        diChuyenTien(250);
-      } // Đẩy cần lên
-      else if (trucY >= 150) {
-        diChuyenLui(250);
-      } // Kéo cần xuống
-      else if (trucX <= -150) {
-        quayTrai(200);
-      } // Gạt sang trái
-      else if (trucX >= 150) {
-        quayPhai(200);
-      } // Gạt sang phải
-      else {
+      // Vùng chết (Deadzone) để tránh xe tự trôi khi không chạm cần
+      int deadzone = 40;
+      if (abs(trucY) < deadzone)
+        trucY = 0;
+      if (abs(trucX) < deadzone)
+        trucX = 0;
+
+      if (trucY == 0 && trucX == 0) {
         dungLai();
-      } // Không chạm vào tay cầm thì dừng xe
+        // Log trạng thái dừng xe khi thả cần Joystick (mỗi 1 giây in một lần để
+        // tránh spam)
+        static unsigned long lastStopLog = 0;
+        if (millis() - lastStopLog >= 1000) {
+          lastStopLog = millis();
+          Serial.println("[DONG CO LOG] XE DUNG (Không chạm Joystick)");
+        }
+      } else {
+        // Đảo chiều Y vì đẩy lên (Forward) có giá trị âm (-512)
+        float throttle = -trucY;
+        float steering = trucX;
+
+        // Quy đổi từ dải [-512, 512] của Joystick sang dải PWM [-255, 255]
+        float v_throttle = (throttle / 512.0) * 255.0;
+        float v_steering = (steering / 512.0) * 255.0;
+
+        // Trộn kênh vi sai (Differential Steering) để rẽ trơn tru
+        float leftSpeed = v_throttle + v_steering;
+        float rightSpeed = v_throttle - v_steering;
+
+        // Giới hạn tốc độ trong khoảng [-255, 255]
+        int speedL = constrain((int)leftSpeed, -255, 255);
+        int speedR = constrain((int)rightSpeed, -255, 255);
+
+        // Phát xung điều khiển độc lập hai cụm động cơ
+        setMotorLeft(speedL);
+        setMotorRight(speedR);
+
+        // In log hướng motor và tốc độ ra Serial (mỗi 200ms)
+        static unsigned long lastMotorLog = 0;
+        if (millis() - lastMotorLog >= 200) {
+          lastMotorLog = millis();
+
+          String dirL = (speedL > 0) ? "TIEN" : ((speedL < 0) ? "LUI" : "DUNG");
+          String dirR = (speedR > 0) ? "TIEN" : ((speedR < 0) ? "LUI" : "DUNG");
+
+          Serial.printf("[DONG CO LOG] JoyL: (X=%d, Y=%d) | Bánh TRÁI: %s "
+                        "(PWM=%d) | Bánh PHẢI: %s (PWM=%d)\n",
+                        trucX, trucY, dirL.c_str(), abs(speedL), dirR.c_str(),
+                        abs(speedR));
+        }
+      }
     }
   }
   delay(10); // Nghỉ 10 mili-giây cho hệ thống mượt mà
@@ -105,42 +147,142 @@ void loop() {
 
 // --- CÁC HÀM XỬ LÝ DI CHUYỂN ---
 void diChuyenTien(int tocDo) {
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, tocDo);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, tocDo);
+  Serial.println("tien");
+  setMotorLeft(tocDo);
+  setMotorRight(tocDo);
 }
 void diChuyenLui(int tocDo) {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  analogWrite(ENA, tocDo);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
-  analogWrite(ENB, tocDo);
+  Serial.println("lui");
+
+  setMotorLeft(-tocDo);
+  setMotorRight(-tocDo);
 }
 void quayTrai(int tocDo) {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, 0);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, tocDo);
+  Serial.println("trai");
+
+  setMotorLeft(-tocDo); // Quay xe tại chỗ trái: trái lùi, phải tiến
+  setMotorRight(tocDo);
 }
 void quayPhai(int tocDo) {
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, tocDo);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, 0);
+  Serial.println("phai");
+
+  setMotorLeft(tocDo); // Quay xe tại chỗ phải: trái tiến, phải lùi
+  setMotorRight(-tocDo);
 }
 void dungLai() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  analogWrite(ENA, 0);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENB, 0);
+  setMotorLeft(0);
+  setMotorRight(0);
+}
+
+// Hàm in log các tín hiệu từ tay cầm ra Serial để theo dõi
+void inLogTayCam(ControllerPtr ctl) {
+  // Giới hạn tần suất in log để tránh tràn Serial (mỗi 250ms in 1 lần)
+  static unsigned long lastLogTime = 0;
+  if (millis() - lastLogTime < 250) {
+    return;
+  }
+  lastLogTime = millis();
+
+  // 1. Đọc các trục Joystick (khoảng -512 đến 511)
+  int lx = ctl->axisX();
+  int ly = ctl->axisY();
+  int rx = ctl->axisRX();
+  int ry = ctl->axisRY();
+
+  // 2. Đọc cò (phanh và ga) (khoảng 0 đến 1023)
+  int phanh = ctl->brake();
+  int ga = ctl->throttle();
+
+  // 3. Đọc D-Pad (Phím chữ thập)
+  int dpad = ctl->dpad();
+  String dpadStr = "";
+  if (dpad & DPAD_UP)
+    dpadStr += "LEN ";
+  if (dpad & DPAD_DOWN)
+    dpadStr += "XUONG ";
+  if (dpad & DPAD_LEFT)
+    dpadStr += "TRAI ";
+  if (dpad & DPAD_RIGHT)
+    dpadStr += "PHAI ";
+  if (dpadStr == "")
+    dpadStr = "KHONG";
+
+  // 4. Đọc các nút bấm chính
+  String nutStr = "";
+  if (ctl->a())
+    nutStr += "A ";
+  if (ctl->b())
+    nutStr += "B ";
+  if (ctl->x())
+    nutStr += "X ";
+  if (ctl->y())
+    nutStr += "Y ";
+  if (ctl->l1())
+    nutStr += "L1 ";
+  if (ctl->r1())
+    nutStr += "R1 ";
+  if (nutStr == "")
+    nutStr = "KHONG";
+
+  // 5. In ra màn hình Serial Monitor với định dạng dễ đọc
+  Serial.print("[LOG TAY CAM] ");
+  Serial.print("JoyL: (X=");
+  Serial.print(lx);
+  Serial.print(", Y=");
+  Serial.print(ly);
+  Serial.print(") | ");
+  Serial.print("JoyR: (X=");
+  Serial.print(rx);
+  Serial.print(", Y=");
+  Serial.print(ry);
+  Serial.print(") | ");
+  Serial.print("Dpad: ");
+  Serial.print(dpadStr);
+  Serial.print(" | ");
+  Serial.print("Nút: ");
+  Serial.print(nutStr);
+  Serial.print(" | ");
+  Serial.print("Cò Trái: ");
+  Serial.print(phanh);
+  Serial.print(" | ");
+  Serial.print("Cò Phải: ");
+  Serial.println(ga);
+}
+
+// Hàm điều khiển bánh bên trái (Cho phép chạy cả Tiến & Lùi trơn tru)
+// Đấu nối: Đỏ nối OUT1, Đen nối OUT2 -> Điều khiển bằng IN1, IN2, ENA
+void setMotorLeft(int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, speed);
+  } else if (speed < 0) {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    analogWrite(ENA, -speed);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, 0);
+  }
+}
+
+// Hàm điều khiển bánh bên phải (Cho phép chạy cả Tiến & Lùi trơn tru)
+// Đấu nối: Đỏ nối OUT3, Đen nối OUT4 -> Điều khiển bằng IN3, IN4, ENB
+void setMotorRight(int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, speed);
+  } else if (speed < 0) {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    analogWrite(ENB, -speed);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, 0);
+  }
 }
