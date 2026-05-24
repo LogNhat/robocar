@@ -99,6 +99,22 @@ int readLine(int &error) {
       weightedSum += weights[i];
       activeCount++;
     }
+    
+    // 2. Điều khiển vi sai giữ thẳng bằng Gyro
+    float error = currentHeading - targetHeading;
+    float gyroZ = readGyroZ() * 57.2957795; // rad/s sang deg/s
+    
+    // PD Loop
+    int correction = gyroKp * error + gyroKd * gyroZ;
+    correction = constrain(correction, -60, 60); 
+    
+    int leftSpeed  = BASE_SPEED - correction;
+    int rightSpeed = BASE_SPEED + correction;
+    
+    setMotorLeft(leftSpeed);
+    setMotorRight(rightSpeed);
+    
+    delay(10);
   }
 
   if (activeCount == 0)
