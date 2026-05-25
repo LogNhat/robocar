@@ -29,7 +29,24 @@ Mạch L298N điều khiển hai cụm động cơ độc lập qua các chân E
 
 ---
 
-# 2. L298N ↔ Động cơ (Motors)
+# 2. ESP32 ↔ Động cơ Servo (Cánh tay Robot)
+
+Cánh tay robot sử dụng 5 động cơ Servo được kết nối trực tiếp với các chân GPIO của ESP32 và được điều khiển bằng Tay cầm Bluetooth qua cần gạt Analog PHẢI (Right Joystick) và các nút phụ trợ.
+
+| Động cơ Servo | ESP32 (GPIO) | Điều khiển tay cầm | Chức năng chi tiết |
+| :--- | :---: | :--- | :--- |
+| **Servo Đế 1 (Base Lift 1)** | **GPIO 15** | **Right Joystick Y** (Lên/Xuống) | Nâng/hạ khớp vai (Đế - Servo 1) |
+| **Servo Đế 2 (Base Lift 2)** | **GPIO 4** | **Right Joystick Y** (Lên/Xuống) | Nâng/hạ khớp vai (Đế - Servo 2, đồng bộ cùng Servo 1) |
+| **Servo Giữa (Elbow)** | **GPIO 16** | **Nút L1 / R1** | Co/duỗi khớp khuỷu tay (giữa cánh tay) |
+| **Servo Ngoài Cùng (Wrist)** | **GPIO 17** | **Nút X / Y** | Nâng/hạ khớp cổ tay (sát kẹp gắp) |
+| **Servo Kẹp Gắp (Gripper)** | **GPIO 5** | **Nút A / B** | Mở/đóng kẹp gắp vật thể |
+
+> [!NOTE]
+> Do 5 động cơ Servo tiêu thụ dòng điện tức thời rất lớn khi hoạt động đồng thời, **KHÔNG ĐƯỢC** cấp nguồn trực tiếp từ chân 5V/3.3V của ESP32. Hãy sử dụng nguồn ngoài (như mạch Buck hạ áp xuống 5V - 6V, dòng tối thiểu 3A - 5A) và **phải nối chung Mass (GND)** với ESP32!
+
+---
+
+# 3. L298N ↔ Động cơ (Motors)
 
 Các chân đầu ra công suất của L298N kết nối trực tiếp với 2 cụm động cơ.
 
@@ -50,7 +67,7 @@ Các chân đầu ra công suất của L298N kết nối trực tiếp với 2 
 
 ---
 
-# 3. Kết nối nguồn cấp & Mass chung
+# 4. Kết nối nguồn cấp & Mass chung
 
 Do động cơ DC tiêu thụ dòng lớn và sinh ra xung nhiễu lớn, việc phân tách nguồn và thiết lập mass chung là bắt buộc.
 
@@ -84,12 +101,12 @@ Do động cơ DC tiêu thụ dòng lớn và sinh ra xung nhiễu lớn, việc
 
 ---
 
-# 4. Tóm tắt mã nguồn cấu hình chân (Pin Map Code)
+# 5. Tóm tắt mã nguồn cấu hình chân (Pin Map Code)
 
 Trích đoạn khai báo chân từ `main.cpp`:
 
 ```cpp
-// --- SƠ ĐỒ CHÂN THEO ĐÚNG ĐẤU NỐI THỰC TẾ ---
+// --- SƠ ĐỒ CHÂN ĐỘNG CƠ DC THEO ĐÚNG ĐẤU NỐI THỰC TẾ ---
 int IN1 = 27;
 int IN2 = 26;
 int ENA = 14; // OUT1 & OUT2 -> Cụm bánh TRÁI (Đỏ OUT1, Đen OUT2)
@@ -97,11 +114,18 @@ int ENA = 14; // OUT1 & OUT2 -> Cụm bánh TRÁI (Đỏ OUT1, Đen OUT2)
 int IN3 = 25;
 int IN4 = 33;
 int ENB = 32; // OUT3 & OUT4 -> Cụm bánh PHẢI (Đỏ OUT3, Đen OUT4)
+
+// --- SƠ ĐỒ CHÂN CÁC ĐỘNG CƠ SERVO CÁNH TAY ROBOT ---
+const int PIN_BASE_ROT   = 15; // Servo xoay đế 1 (Base Rotation)
+const int PIN_BASE_LIFT  = 4;  // Servo nâng đế 2 (Base Lift)
+const int PIN_MID        = 16; // Servo khớp giữa (Elbow)
+const int PIN_OUTER      = 17; // Servo khớp ngoài cùng, sát kẹp gắp (Wrist)
+const int PIN_GRIPPER    = 5;  // Servo khớp kẹp gắp (Gripper)
 ```
 
 ---
 
-# 5. Cấu trúc và Thuật toán điều khiển trong `main.cpp`
+# 6. Cấu trúc và Thuật toán điều khiển trong `main.cpp`
 
 Hệ thống điều khiển qua tay cầm Bluetooth có hai chế độ hoạt động chính:
 
@@ -127,7 +151,24 @@ Khi không nhấn D-pad, hệ thống sẽ đọc giá trị cần Analog trái 
 
 ---
 
-# 6. Quy ước hướng Robot và Motor
+## C. Điều khiển Trơn Tru Cánh Tay Robot bằng Cần gạt Phải (Right Joystick) & Các Nút
+Hệ thống điều khiển cánh tay robot sử dụng các cơ chế nội suy góc và giới hạn hành trình thông minh để bảo vệ cơ cấu cơ khí:
+1. **Điều khiển Analog cho 2 Servo Đế (Base Lift):**
+   - Trục Y cần Analog Phải (`axisRY`): Điều khiển đồng thời cả **Servo Đế 1 (Pin 15)** và **Servo Đế 2 (Pin 4)** từ `0°` đến `180°` để nâng/hạ cánh tay. Đẩy lên để nâng khớp đế cánh tay lên, kéo xuống để hạ xuống. Hai Servo hoạt động đồng hành cùng nhau (đồng bộ hoặc ngược chiều tùy cách lắp ráp cơ khí) giúp chịu tải tốt hơn.
+   - Trục X cần Analog Phải (`axisRX`): Không sử dụng (vì khớp đế chỉ có nâng/hạ lên xuống chứ không xoay ngang).
+2. **Điều khiển Khớp Giữa (Elbow) và Khớp Ngoài Cùng (Wrist) bằng Nút:**
+   - **Nút L1 / R1:** Co / duỗi khớp giữa **Servo Giữa (Pin 16)** từ `0°` đến `180°`. Giúp gập và mở rộng tầm với của cánh tay.
+   - **Nút X / Y:** Nâng / hạ khớp cổ tay **Servo Ngoài Cùng (Pin 17)** từ `0°` đến `180°`. Giúp chỉnh hướng kẹp gắp vật thể.
+3. **Điều khiển Kẹp Gắp (Gripper) bằng Nút A / B:**
+   - **Nút A:** Mở rộng kẹp gắp (giới hạn an toàn tối thiểu `10°`).
+   - **Nút B:** Đóng khít kẹp gắp để ôm vật thể (giới hạn an toàn tối đa `170°`).
+4. **Cơ chế nội suy trơn mượt & bảo vệ (Interpolation & Protection):**
+   - Xe liên tục cộng / trừ góc điều khiển dựa trên độ lệch của cần gạt và trạng thái giữ nút bấm ở mỗi chu kỳ (`loop()`). Cánh tay sẽ di chuyển mượt mà, không bị giật cục.
+   - Khóa góc giới hạn tối đa và tối thiểu (`constrain()`) để các bánh răng servo không bị kẹt cứng hoặc làm hỏng phần cứng khi chạm mốc vật lý.
+
+---
+
+# 7. Quy ước hướng Robot và Motor
 
 ```
              [ Bánh TRÁI ]                 [ Bánh PHẢI ]
