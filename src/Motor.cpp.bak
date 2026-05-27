@@ -1,61 +1,143 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <Arduino.h>
-#include "Motor.h"
-#include "Config.h"
+#include <VL53L0X.h>
+#include <Wire.h>
 
-void motorSetup() {
-  pinMode(AIN1, OUTPUT); 
-  pinMode(AIN2, OUTPUT);
-  pinMode(BIN1, OUTPUT); 
-  pinMode(BIN2, OUTPUT);
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Chân điều khiển 3 Laser
+#define XSHUT_L 4
+#define XSHUT_F 16
+#define XSHUT_R 17
+
+#define ADDR_L 0x30 
+#define ADDR_F 0x31 
+// Mắt Phải giữ nguyên 0x29
+
+VL53L0X laserL;
+VL53L0X laserF;
+VL53L0X laserR; 
+Adafruit_MPU6050 mpu;
+
+// Hàm bắn lệnh I2C thô (Code cơ bản của bạn)
+void changeRawAddress(byte oldAddr, byte newAddr) {
+  Wire.beginTransmission(oldAddr);
+  Wire.write(0x8A); 
+  Wire.write(newAddr & 0x7F); 
+  Wire.endTransmission();
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n===== KHOI DONG LAI GHEP (RAW I2C + LIBRARY) =====");
+
+  // Ép tắt toàn bộ
+  pinMode(XSHUT_L, OUTPUT); digitalWrite(XSHUT_L, LOW);
+  pinMode(XSHUT_F, OUTPUT); digitalWrite(XSHUT_F, LOW);
+  pinMode(XSHUT_R, OUTPUT); digitalWrite(XSHUT_R, LOW);
+  delay(400); 
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(100);
+
+  // =======================================================
+  // GIAI ĐOẠN 1: DÙNG CODE CƠ BẢN (RAW I2C) ĐỂ ĐỔI ĐỊA CHỈ
+  // =======================================================
+  Serial.println("--- GIAI DOAN 1: SET DIA CHI PHAN CUNG ---");
   
-  ledcSetup(0, 20000, 8); 
-  ledcSetup(1, 20000, 8);
-  ledcAttachPin(PWMA, 0); 
-  ledcAttachPin(PWMB, 1);
-}
+  // 1. Xử lý Laser Trái
+  pinMode(XSHUT_L, INPUT_PULLUP);
+  delay(150);
+  changeRawAddress(0x29, ADDR_L); // Bắn lệnh thô ép sang 0x30
+  delay(100);
 
-void setMotor(int left, int right) {
-  left = constrain(left, -255, 255);
-  right = constrain(right, -255, 255);
-  if (INVERT_LEFT_MOTOR) left = -left;
-  if (INVERT_RIGHT_MOTOR) right = -right;
+  // 2. Xử lý Laser Giữa
+  pinMode(XSHUT_F, INPUT_PULLUP);
+  delay(150);
+  changeRawAddress(0x29, ADDR_F); // Bắn lệnh thô ép sang 0x31
+  delay(100);
 
-  // Motor Trái (A)
-  digitalWrite(AIN1, left >= 0 ? HIGH : LOW);
-  digitalWrite(AIN2, left >= 0 ? LOW : HIGH);
-  ledcWrite(0, abs(left));
-
-  // Motor Phải (B)
-  digitalWrite(BIN1, right >= 0 ? HIGH : LOW);
-  digitalWrite(BIN2, right >= 0 ? LOW : HIGH);
-  ledcWrite(1, abs(right));
-}
-
-void stopMotor() {
-  setMotor(0, 0);
-}
-
-// BÙ DẢI CHẾT (Deadband Compensation)
-// Truyền vào tốc độ từ -100% đến 100%
-void setTrueSpeed(float leftPercent, float rightPercent) {
-  const int MIN_PWM = 80; // Ngưỡng PWM nhỏ nhất mà xe có thể nhúc nhích
+  // 3. Xử lý Laser Phải (Giữ nguyên 0x29)
+  pinMode(XSHUT_R, INPUT_PULLUP);
+  delay(150);
   
-  int leftPWM = 0;
-  int rightPWM = 0;
+  Serial.println("Done! Phan cung da an toa o 0x30, 0x31, 0x29.");
+  delay(500); // Cho Bus nghỉ ngơi sau khi thao tác thô
 
-  // Bánh Trái
-  if (leftPercent > 0) {
-    leftPWM = map(leftPercent, 0, 100, MIN_PWM, 255);
-  } else if (leftPercent < 0) {
-    leftPWM = map(leftPercent, -100, 0, -255, -MIN_PWM);
+  // =======================================================
+  // GIAI ĐOẠN 2: DÙNG THƯ VIỆN ĐỂ KẾT NỐI VÀ ĐỌC
+  // =======================================================
+  Serial.println("--- GIAI DOAN 2: INIT THU VIEN ---");
+
+  // --- LASER TRÁI ---
+  Serial.print("Init LASER TRAI... ");
+  laserL.setBus(&Wire);
+  laserL.setAddress(ADDR_L); // Báo cho thư viện biết thiết bị đang ở 0x30
+  laserL.setTimeout(1000);   // Cho phép tải cấu hình tẹt ga 1 giây
+  if (!laserL.init()) Serial.println("THAT BAI!");
+  else {
+    laserL.startContinuous(50);
+    Serial.println("OK -> 0x30");
   }
 
-  // Bánh Phải
-  if (rightPercent > 0) {
-    rightPWM = map(rightPercent, 0, 100, MIN_PWM, 255);
-  } else if (rightPercent < 0) {
-    rightPWM = map(rightPercent, -100, 0, -255, -MIN_PWM);
+  // --- LASER GIỮA ---
+  Serial.print("Init LASER GIUA... ");
+  laserF.setBus(&Wire);
+  laserF.setAddress(ADDR_F); // Báo cho thư viện biết thiết bị đang ở 0x31
+  laserF.setTimeout(1000);
+  if (!laserF.init()) Serial.println("THAT BAI!");
+  else {
+    laserF.startContinuous(50);
+    Serial.println("OK -> 0x31");
   }
 
-  setMotor(leftPWM, rightPWM);
+  // --- LASER PHẢI ---
+  Serial.print("Init LASER PHAI... ");
+  laserR.setBus(&Wire);
+  // Không gọi setAddress, để thư viện tự kết nối ở 0x29 mặc định
+  laserR.setTimeout(1000);
+  if (!laserR.init()) Serial.println("THAT BAI!");
+  else {
+    laserR.startContinuous(50);
+    Serial.println("OK -> 0x29 (Giu nguyen)");
+  }
+
+  // =======================================================
+  // KHỞI TẠO MPU6050
+  // =======================================================
+  Serial.print("Init MPU6050 ... ");
+  if (!mpu.begin(0x68, &Wire)) Serial.println("THAT BAI!");
+  else {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    Serial.println("OK -> 0x68");
+  }
+
+  Serial.println("===== HE THONG 3 LASER SAN SANG =====");
+  delay(1000);
+}
+
+void loop() {
+  int readingL = laserL.readRangeContinuousMillimeters();
+  int readingF = laserF.readRangeContinuousMillimeters();
+  int readingR = laserR.readRangeContinuousMillimeters();
+
+  if (laserL.timeoutOccurred()) readingL = 8190;
+  if (laserF.timeoutOccurred()) readingF = 8190;
+  if (laserR.timeoutOccurred()) readingR = 8190;
+
+  // Tráo lại biến cho khớp với dây thực tế (F và R)
+  int dL = readingL; 
+  int dR = readingF; 
+  int dF = readingR; 
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  Serial.printf("L: %4d mm | F: %4d mm | R: %4d mm || Gyro Z: %.2f rad/s\n", dL, dF, dR, g.gyro.z);
+  delay(60);
 }

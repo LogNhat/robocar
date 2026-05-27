@@ -1,0 +1,135 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Arduino.h>
+#include <VL53L0X.h>
+#include <Wire.h>
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Chân điều khiển 3 Laser
+#define XSHUT_L 4
+#define XSHUT_F 16
+#define XSHUT_R 17
+
+#define ADDR_L 0x30 
+#define ADDR_F 0x31 
+// Mắt Phải giữ nguyên 0x29
+
+VL53L0X laserL;
+VL53L0X laserF;
+VL53L0X laserR; 
+Adafruit_MPU6050 mpu;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n===== HE THONG 3 LASER (HYBRID INIT) =====");
+
+  // 1. Ép tắt cả 3 Laser
+  pinMode(XSHUT_L, OUTPUT); digitalWrite(XSHUT_L, LOW);
+  pinMode(XSHUT_F, OUTPUT); digitalWrite(XSHUT_F, LOW);
+  pinMode(XSHUT_R, OUTPUT); digitalWrite(XSHUT_R, LOW);
+  delay(500); 
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(100);
+
+  // =======================================================
+  // KỊCH BẢN 2 & 3: XỬ LÝ CON TRÁI
+  // =======================================================
+  Serial.print("Init LASER TRAI... ");
+  pinMode(XSHUT_L, INPUT_PULLUP);
+  delay(200);
+  
+  laserL.setBus(&Wire);
+  laserL.setTimeout(1000); // Cho tận 1 giây để tải cấu hình, không lo bị ngắt
+  
+  // Đổi địa chỉ TRƯỚC KHI init (Giống hệt Raw Scan)
+  laserL.setAddress(ADDR_L); 
+  delay(50);
+  
+  if (!laserL.init()) {
+    Serial.println("THAT BAI!");
+    while(1) delay(10);
+  }
+  laserL.startContinuous(50);
+  Serial.println("OK -> 0x30");
+  delay(200);
+
+  // =======================================================
+  // KỊCH BẢN 4 & 5: XỬ LÝ CON GIỮA
+  // =======================================================
+  Serial.print("Init LASER GIUA... ");
+  pinMode(XSHUT_F, INPUT_PULLUP);
+  delay(200);
+  
+  laserF.setBus(&Wire);
+  laserF.setTimeout(1000); 
+  
+  laserF.setAddress(ADDR_F); 
+  delay(50);
+  
+  if (!laserF.init()) {
+    Serial.println("THAT BAI!");
+    while(1) delay(10);
+  }
+  laserF.startContinuous(50);
+  Serial.println("OK -> 0x31");
+  delay(200);
+
+  // =======================================================
+  // KỊCH BẢN 6: XỬ LÝ CON PHẢI (GIỮ NGUYÊN)
+  // =======================================================
+  Serial.print("Init LASER PHAI... ");
+  pinMode(XSHUT_R, INPUT_PULLUP);
+  delay(200);
+  
+  laserR.setBus(&Wire);
+  laserR.setTimeout(1000);
+  // Bỏ qua setAddress, để nó tự init ở 0x29
+  if (!laserR.init()) {
+    Serial.println("THAT BAI!");
+    while(1) delay(10);
+  }
+  laserR.startContinuous(50);
+  Serial.println("OK -> 0x29 (Giu nguyen)");
+  delay(200);
+
+  // =======================================================
+  // BƯỚC CUỐI: KHỞI TẠO MPU6050
+  // =======================================================
+  Serial.print("Init MPU6050 ... ");
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("THAT BAI!");
+  } else {
+    Serial.println("OK -> 0x68");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  Serial.println("===== HE THONG SAN SANG =====");
+  delay(1000);
+}
+
+void loop() {
+  int readingL = laserL.readRangeContinuousMillimeters();
+  int readingF = laserF.readRangeContinuousMillimeters();
+  int readingR = laserR.readRangeContinuousMillimeters();
+
+  if (laserL.timeoutOccurred()) readingL = 8190;
+  if (laserF.timeoutOccurred()) readingF = 8190;
+  if (laserR.timeoutOccurred()) readingR = 8190;
+
+  // Xử lý đổi chân thực tế
+  int dL = readingL; 
+  int dR = readingF; 
+  int dF = readingR; 
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  Serial.printf("L: %4d mm | F: %4d mm | R: %4d mm || Gyro Z: %.2f rad/s\n", dL, dF, dR, g.gyro.z);
+  delay(60);
+}

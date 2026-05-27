@@ -1,0 +1,333 @@
+#include "Adafruit_VL53L0X.h"
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Arduino.h>
+#include <Wire.h>
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Chân điều khiển 2 Laser
+#define XSHUT_L 17
+#define XSHUT_R 16
+#define ADDR_L 0x30
+#define ADDR_R 0x31
+
+// Cấu hình động cơ TB6612FNG
+#define PWMA 27
+#define AIN1 18
+#define AIN2 19
+#define PWMB 13
+#define BIN1 14
+#define BIN2 23
+
+// ========================================================
+// NGƯỠNG ĐỊNH CẤU HÌNH MỚI (CHẬM & CHUẨN)
+// ========================================================
+#define NGO_RE_PHAI_HO 300  // > 300mm -> Rẽ Phải
+#define NGO_RE_TRAI_HO 250  // > 250mm -> Rẽ Trái
+#define TUONG_TRUOC_CHAN 85 // < 85mm -> Chặn trước mặt
+
+// Mốc đi thẳng lý tưởng: Trái 60mm, Phải 100mm
+#define MOC_CHONG_CA_TRAI 55 // Nhỏ hơn 55 là quá sát trái
+#define MOC_CHONG_CA_PHAI 95 // Nhỏ hơn 95 là quá sát phải
+
+// MỐC BÁO ĐỘNG KẸT TƯỜNG KHI ĐI THẲNG
+#define MOC_KET_TRAI 35 // Rớt xuống 35 là mài hông kẹt tường trái
+#define MOC_KET_PHAI 70 // Rớt xuống 70 là mài hông kẹt tường phải
+
+// TỐC ĐỘ ĐÃ GIẢM ĐỂ XE CHẠY MƯỢT VÀ ỔN ĐỊNH HƠN
+#define BASE_SPEED 100 // Tốc độ chạy thẳng
+#define BUMP_SPEED 25  // Lực nhích bù làn
+#define TURN_SPEED 115 // Tốc độ xoay tại chỗ
+
+// CẤU HÌNH GÓC QUAY THỰC TẾ
+#define GOC_RE_TRAI 50.0
+#define GOC_RE_PHAI -50.0
+#define GOC_QUAY_DAU 100.0
+
+Adafruit_VL53L0X laserL = Adafruit_VL53L0X();
+Adafruit_VL53L0X laserR = Adafruit_VL53L0X();
+Adafruit_MPU6050 mpu;
+
+bool isAliveL = false;
+bool isAliveR = false;
+
+// Biến cho Bộ lọc mượt (EMA Filter)
+float smoothL = 8190.0;
+float smoothR = 8190.0;
+bool firstRead = true;
+
+// ==========================================
+// CÁC HÀM ĐIỀU KHIỂN ĐỘNG CƠ
+// ==========================================
+void setMotorL(int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+  } else if (speed < 0) {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+  }
+  analogWrite(PWMA, abs(speed));
+}
+
+void setMotorR(int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+  } else if (speed < 0) {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+  }
+  analogWrite(PWMB, abs(speed));
+}
+
+void dieuKhienXe(int speedL, int speedR) {
+  setMotorL(speedL);
+  setMotorR(speedR);
+}
+
+void dungXe() { dieuKhienXe(0, 0); }
+
+// ==========================================
+// HÀM XOAY TẠI CHỖ (CÓ TÍCH HỢP CHỐNG KẸT XOAY)
+// ==========================================
+void xoayXe(float gocMucTieu) {
+  dungXe();
+  delay(300); // Triệt tiêu quán tính
+
+  float gocDaXoay = 0.0;
+  unsigned long startTime = millis();
+  unsigned long lastTime = startTime;
+  bool biKet = false;
+
+  if (gocMucTieu > 0) {
+    dieuKhienXe(-TURN_SPEED, TURN_SPEED);
+  } else {
+    dieuKhienXe(TURN_SPEED, -TURN_SPEED);
+  }
+
+  while (abs(gocDaXoay) < abs(gocMucTieu)) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0;
+    lastTime = now;
+
+    float tocDoGoc = g.gyro.z * 57.2958;
+    if (abs(tocDoGoc) > 1.0) {
+      gocDaXoay += (tocDoGoc * dt);
+    }
+
+    if (now - startTime > 3500) {
+      biKet = true;
+      break;
+    }
+    delay(5);
+  }
+
+  dungXe();
+
+  if (biKet) {
+    Serial.println("XOAY QUA LAU! Check ket tuong...");
+    VL53L0X_RangingMeasurementData_t measure;
+    int checkL = 8190, checkR = 8190;
+
+    if (isAliveL) {
+      laserL.rangingTest(&measure, false);
+      if (measure.RangeStatus != 4)
+        checkL = measure.RangeMilliMeter;
+    }
+    if (isAliveR) {
+      laserR.rangingTest(&measure, false);
+      if (measure.RangeStatus != 4)
+        checkR = measure.RangeMilliMeter;
+    }
+
+    if (checkL < 80 || checkR < 80) {
+      Serial.println("KET TUONG! -> SANG SO LUI THOAT HIEM");
+      dieuKhienXe(-BASE_SPEED, -BASE_SPEED);
+      delay(600);
+      dungXe();
+    }
+  } else {
+    Serial.printf("XOAY XONG! Goc: %.2f do\n", gocDaXoay);
+  }
+
+  delay(300);
+}
+
+// ==========================================
+// HÀM KHỞI TẠO CẢM BIẾN LASER
+// ==========================================
+bool initLaser(Adafruit_VL53L0X &laser, int xshutPin, uint8_t newAddr,
+               const char *name) {
+  Serial.print("Init ");
+  Serial.print(name);
+  Serial.print(" ... ");
+  pinMode(xshutPin, OUTPUT);
+  digitalWrite(xshutPin, HIGH);
+  delay(200);
+
+  if (!laser.begin(newAddr, false, &Wire)) {
+    Serial.println("THAT BAI!");
+    digitalWrite(xshutPin, LOW);
+    return false;
+  }
+  Serial.printf("OK -> 0x%02X\n", newAddr);
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n===== MAZE RUNNER CORE (FULL ANTI-STUCK) =====");
+
+  pinMode(PWMA, OUTPUT);
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  dungXe();
+
+  pinMode(XSHUT_L, OUTPUT);
+  digitalWrite(XSHUT_L, LOW);
+  pinMode(XSHUT_R, OUTPUT);
+  digitalWrite(XSHUT_R, LOW);
+  delay(300);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(100);
+
+  isAliveL = initLaser(laserL, XSHUT_L, ADDR_L, "TRAI");
+  delay(500);
+  isAliveR = initLaser(laserR, XSHUT_R, ADDR_R, "PHAI");
+  delay(200);
+
+  Serial.print("Init MPU6050 ... ");
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("THAT BAI!");
+    while (1)
+      delay(10);
+  }
+  Serial.println("OK");
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_10_HZ);
+
+  Serial.println("On dinh he thong trong 3 giay...");
+  delay(3000);
+}
+
+void loop() {
+  VL53L0X_RangingMeasurementData_t measure;
+  int dL_raw = 8190, dR_raw = 8190;
+
+  // 1. ĐỌC LASER THÔ
+  if (isAliveL) {
+    laserL.rangingTest(&measure, false);
+    if (measure.RangeStatus != 4)
+      dL_raw = measure.RangeMilliMeter;
+  }
+  if (isAliveR) {
+    laserR.rangingTest(&measure, false);
+    if (measure.RangeStatus != 4)
+      dR_raw = measure.RangeMilliMeter;
+  }
+
+  // 2. BỘ LỌC LÀM MƯỢT TÍN HIỆU LASER
+  if (firstRead) {
+    smoothL = (dL_raw == 8190) ? 60.0 : dL_raw;
+    smoothR = (dR_raw == 8190) ? 100.0 : dR_raw;
+    firstRead = false;
+  } else {
+    if (dL_raw == 8190)
+      smoothL = 8190;
+    else
+      smoothL = (smoothL * 0.6) + (dL_raw * 0.4);
+
+    if (dR_raw == 8190)
+      smoothR = 8190;
+    else
+      smoothR = (smoothR * 0.6) + (dR_raw * 0.4);
+  }
+
+  Serial.printf("L(smooth): %4d mm | R(smooth): %4d mm -> ", (int)smoothL,
+                (int)smoothR);
+
+  // 3. ĐỊNH NGHĨA TRẠNG THÁI MÔI TRƯỜNG
+  bool coHemPhai = (smoothR > NGO_RE_PHAI_HO);
+  bool coHemTrai = (smoothL > NGO_RE_TRAI_HO);
+  bool biChanTruoc = (smoothL < TUONG_TRUOC_CHAN && smoothR < TUONG_TRUOC_CHAN);
+
+  // Trạng thái kẹt tường khi đang cố đi thẳng
+  bool biKetTrai = (smoothL < MOC_KET_TRAI && !biChanTruoc);
+  bool biKetPhai = (smoothR < MOC_KET_PHAI && !biChanTruoc);
+
+  // ========================================================
+  // 4. LOGIC GIẢI MÊ CUNG CÓ CHỐNG KẸT CHỦ ĐỘNG
+  // ========================================================
+
+  // ƯU TIÊN 1: NẾU KẸT TƯỜNG KHI ĐI THẲNG -> LÙI XÉO ĐỂ THOÁT
+  if (biKetTrai) {
+    Serial.println("[KẸT TRÁI] -> Lùi xéo chỉnh mũi xe ra!");
+    // Lùi bánh trái mạnh, bánh phải yếu -> Ép đuôi sang trái, mũi bẩy sang phải
+    dieuKhienXe(-(BASE_SPEED + 35), -(BASE_SPEED - 15));
+    delay(350);
+    dungXe();
+  } else if (biKetPhai) {
+    Serial.println("[KẸT PHẢI] -> Lùi xéo chỉnh mũi xe ra!");
+    // Lùi bánh phải mạnh, bánh trái yếu -> Ép đuôi sang phải, mũi bẩy sang trái
+    dieuKhienXe(-(BASE_SPEED - 15), -(BASE_SPEED + 35));
+    delay(350);
+    dungXe();
+  }
+
+  // ƯU TIÊN 2: TÌM HẺM PHẢI
+  else if (coHemPhai) {
+    Serial.println("[RẼ PHẢI]");
+    dieuKhienXe(BASE_SPEED, BASE_SPEED);
+    delay(280);
+    xoayXe(GOC_RE_PHAI);
+    dieuKhienXe(BASE_SPEED, BASE_SPEED);
+    delay(400);
+  }
+
+  // ƯU TIÊN 3: ĐI THẲNG & GIỮ LÀN (BANG-BANG CONTROL)
+  else if (!biChanTruoc) {
+    Serial.println("[ĐI THẲNG]");
+    if (smoothL < MOC_CHONG_CA_TRAI) {
+      dieuKhienXe(BASE_SPEED + BUMP_SPEED, BASE_SPEED - BUMP_SPEED);
+    } else if (smoothR < MOC_CHONG_CA_PHAI) {
+      dieuKhienXe(BASE_SPEED - BUMP_SPEED, BASE_SPEED + BUMP_SPEED);
+    } else {
+      dieuKhienXe(BASE_SPEED, BASE_SPEED);
+    }
+  }
+
+  // ƯU TIÊN 4: RẼ TRÁI
+  else if (coHemTrai) {
+    Serial.println("[RẼ TRÁI]");
+    xoayXe(GOC_RE_TRAI);
+  }
+
+  // ƯU TIÊN 5: QUAY ĐẦU (NGÕ CỤT)
+  else {
+    Serial.println("[QUAY ĐẦU]");
+    xoayXe(GOC_QUAY_DAU);
+  }
+
+  delay(40);
+}

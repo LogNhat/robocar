@@ -1,0 +1,125 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Arduino.h>
+#include <VL53L0X.h>
+#include <Wire.h>
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Chân điều khiển Laser
+#define XSHUT_L 4
+#define XSHUT_F 17
+#define XSHUT_R 16
+
+// Địa chỉ I2C mới
+#define ADDR_L 0x30
+#define ADDR_F 0x31
+#define ADDR_R 0x32
+
+VL53L0X laserL;
+VL53L0X laserF;
+VL53L0X laserR;
+Adafruit_MPU6050 mpu;
+
+// Hàm khởi tạo từng laser chuẩn theo tài liệu của Pololu
+bool initLaser(VL53L0X &laser, int xshutPin, uint8_t newAddr,
+               const char *name) {
+  Serial.print("Init ");
+  Serial.print(name);
+  Serial.print(" ... ");
+
+  // 1. Dùng INPUT để thả nổi chân, module sẽ tự kéo lên 2.8V cực kỳ an toàn
+  pinMode(xshutPin, INPUT);
+  delay(150); // Chờ 150ms cho chip VL53L0X boot xong
+
+  // 2. Khởi tạo trực tiếp bằng thư viện Pololu
+  laser.setBus(&Wire);
+  laser.setTimeout(1000);
+
+  if (!laser.init()) {
+    Serial.println("THẤT BẠI (Lỗi I2C hoặc chưa nhận module)!");
+    return false;
+  }
+
+  // 3. Đổi địa chỉ I2C
+  laser.setAddress(newAddr);
+  delay(50); // Chờ chip lưu địa chỉ
+
+  laser.startContinuous(50);
+  Serial.printf("OK -> 0x%02X\n", newAddr);
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n===== KHOI DONG HE THONG ROBOCAR =====");
+
+  // ==========================================
+  // BƯỚC 1: ÉP TẮT LASER TRƯỚC KHI MỞ BUS I2C
+  // ==========================================
+  pinMode(XSHUT_L, OUTPUT);
+  digitalWrite(XSHUT_L, LOW);
+  pinMode(XSHUT_F, OUTPUT);
+  digitalWrite(XSHUT_F, LOW);
+  pinMode(XSHUT_R, OUTPUT);
+  digitalWrite(XSHUT_R, LOW);
+  delay(200); // Chờ một chút để điện xả hết, IC về trạng thái reset
+
+  // ==========================================
+  // BƯỚC 2: KHỞI TẠO BUS I2C VỚI TỐC ĐỘ AN TOÀN
+  // ==========================================
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(100);
+
+  // ==========================================
+  // BƯỚC 3: ĐÁNH THỨC VÀ ĐỔI ĐỊA CHỈ LASER
+  // ==========================================
+  if (!initLaser(laserL, XSHUT_L, ADDR_L, "TRAI"))
+    while (1)
+      delay(10);
+  if (!initLaser(laserF, XSHUT_F, ADDR_F, "GIUA"))
+    while (1)
+      delay(10);
+  if (!initLaser(laserR, XSHUT_R, ADDR_R, "PHAI"))
+    while (1)
+      delay(10);
+
+  // ==========================================
+  // BƯỚC 4: KHỞI TẠO MPU6050 SAU CÙNG
+  // ==========================================
+  Serial.print("Init MPU6050 ... ");
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("THẤT BẠI!");
+  } else {
+    Serial.println("OK -> 0x68");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  Serial.println("===== HE THONG SAN SANG =====");
+  delay(1000);
+}
+
+void loop() {
+  int dL = laserL.readRangeContinuousMillimeters();
+  int dF = laserF.readRangeContinuousMillimeters();
+  int dR = laserR.readRangeContinuousMillimeters();
+
+  if (laserL.timeoutOccurred())
+    dL = 8190;
+  if (laserF.timeoutOccurred())
+    dF = 8190;
+  if (laserR.timeoutOccurred())
+    dR = 8190;
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  Serial.printf("L: %4d mm | F: %4d mm | R: %4d mm || Gyro Z: %.2f rad/s\n", dL,
+                dF, dR, g.gyro.z);
+
+  delay(50);
+}
