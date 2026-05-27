@@ -1,0 +1,59 @@
+#include <Arduino.h>
+
+// Hàm quay so le mượt mà (Pivot Turn: Lùi một bánh, tiến một bánh)
+void rotateSoleTo(float targetHeading) {
+  unsigned long start = millis();
+  
+  while (millis() - start < 4000) { // Giới hạn 4 giây chống kẹt
+    updateHeading(); // Giả định hàm này đã có sẵn để cập nhật currentHeading
+    float error = targetHeading - currentHeading;
+    
+    if (abs(error) < 1.5) break; // Sai số dưới 1.5 độ -> Dừng ngay
+    
+    // Tốc độ giảm dần khi gần đến đích để chống vọt lố (Overshoot)
+    int spd = 85; 
+    if (abs(error) < 30) spd = 65; // Rà phanh khi còn 30 độ
+    if (abs(error) < 10) spd = 55; // Nhích thật chậm khi còn 10 độ
+    
+    if (error > 0) {
+      // Lỗi dương -> Rẽ Trái (Bánh trái lùi, Bánh phải tiến)
+      setMotors(-spd, spd);
+    } else {
+      // Lỗi âm -> Rẽ Phải (Bánh trái tiến, Bánh phải lùi)
+      setMotors(spd, -spd);
+    }
+    
+    delay(10);
+  }
+  
+  // Dừng khựng lại
+  setMotors(0, 0);
+  delay(200);
+}
+
+void turnLeft90() {
+  Serial.println(">> QUAY SO LE: TRÁI 90 ĐỘ");
+  rotateSoleTo(currentHeading + 90.0);
+}
+
+void turnRight90() {
+  Serial.println(">> QUAY SO LE: PHẢI 90 ĐỘ");
+  rotateSoleTo(currentHeading - 90.0);
+}
+
+void turnAround180() {
+  Serial.println(">> QUAY SO LE: QUAY ĐẦU 180 ĐỘ");
+  rotateSoleTo(currentHeading - 180.0);
+}
+
+// Chạy thử test 3 hàm
+void loop() {
+  turnLeft90();
+  delay(2000);
+  
+  turnRight90();
+  delay(2000);
+  
+  turnAround180();
+  delay(3000);
+}

@@ -1,0 +1,641 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_VL53L0X.h>
+#include <Arduino.h>
+#include <Wire.h>
+
+// ============================================================================
+// 1. CẤU HÌNH CHÂN VÀ SAI SỐ
+// ============================================================================
+#define XSHUT_CENTER 15
+#define XSHUT_LEFT 17
+#define XSHUT_RIGHT 16
+
+#define ADDR_CENTER 0x30
+#define ADDR_LEFT 0x31
+#define ADDR_RIGHT 0x32
+
+const int OFFSET_CENTER = -55;
+const int OFFSET_LEFT = -20;
+const int OFFSET_RIGHT = -25;
+
+// Động cơ TB6612FNG (PWMA là Left, PWMB là Right)
+const int PWMA = 27;
+const int AIN1 = 18;
+const int AIN2 = 19;
+const int PWMB = 13;
+const int BIN1 = 14;
+const int BIN2 = 23;
+
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+
+Adafruit_MPU6050 mpu;
+Adafruit_VL53L0X lox_center = Adafruit_VL53L0X();
+Adafruit_VL53L0X lox_left = Adafruit_VL53L0X();
+Adafruit_VL53L0X lox_right = Adafruit_VL53L0X();
+
+// ============================================================================
+// 2. THAM SỐ THUẬT TOÁN BÁM TƯỜNG TRÁI (PD: LASER P + GYRO D)
+// ============================================================================
+const int WALL_TARGET = 30;  // Mục tiêu bám cách tường trái 30mm (3cm) theo yêu cầu
+const int BASE_SPEED = 100;  // Tốc độ đi thẳng cơ bản (nồi đồng cối đá siêu ổn định)
+const int maxCorrection = 70; // Giới hạn chỉnh lái để chống giật cục
+
+// Hệ số PID ngọt ngào đã được chứng minh cực kỳ ổn định
+float Kp = 1.4;  
+float KdGyro = 0.6;  
+const float GYRO_SIGN = 1.0; 
+
+// --- BỘ LỌC EMA CHO LASER ---
+const float EMA_ALPHA = 0.35;
+float smoothLeft = 45.0;
+float smoothCenter = 300.0;
+float smoothRight = 45.0;
+
+// Biến Gyro và Hướng
+float gyroZOffset = 0.0;
+float gyroZDeg = 0.0;       // Vận tốc góc hiện tại (deg/s)
+float currentHeading = 0.0; // Góc hướng tích phân từ gyro
+unsigned long lastGyroTime = 0;
+unsigned long lastTurnTime = 0; // Lưu thời điểm rẽ gần nhất để chống nhiễu ngã rẽ trùng lặp
+
+// ============================================================================
+// 3. ĐIỀU KHIỂN ĐỘNG CƠ (PWMA = Left, PWMB = Right)
+// ============================================================================
+void motorLeft(int s) {
+  s = constrain(s, -255, 255);
+  digitalWrite(AIN1, s >= 0);
+  digitalWrite(AIN2, s < 0);
+  analogWrite(PWMA, abs(s));
+}
+
+void motorRight(int s) {
+  s = constrain(s, -255, 255);
+  digitalWrite(BIN1, s >= 0);
+  digitalWrite(BIN2, s < 0);
+  analogWrite(PWMB, abs(s));
+}
+
+void setMotors(int l, int r) {
+  motorLeft(l);
+  motorRight(r);
+}
+
+// ============================================================================
+// 4. CẢM BIẾN LASER VL53L0X
+// ============================================================================
+bool isDevicePresent(byte address) {
+  Wire.beginTransmission(address);
+  return (Wire.endTransmission() == 0);
+}
+
+void initLaserSensors() {
+  Serial.println("\n[SYSTEM] Khởi động các cảm biến Laser...");
+
+  pinMode(XSHUT_CENTER, OUTPUT);
+  pinMode(XSHUT_LEFT, OUTPUT);
+  pinMode(XSHUT_RIGHT, OUTPUT);
+  digitalWrite(XSHUT_CENTER, LOW);
+  digitalWrite(XSHUT_LEFT, LOW);
+  digitalWrite(XSHUT_RIGHT, LOW);
+  delay(150);
+
+  // CENTER
+  pinMode(XSHUT_CENTER, OUTPUT);
+  digitalWrite(XSHUT_CENTER, HIGH);
+  delay(450);
+  if (!isDevicePresent(0x29)) {
+    Serial.println("❌ Cảm biến CENTER không thức dậy ở 0x29!");
+    while (1) delay(200);
+  }
+  lox_center.begin(ADDR_CENTER, false, &Wire);
+
+  // LEFT
+  pinMode(XSHUT_LEFT, OUTPUT);
+  digitalWrite(XSHUT_LEFT, HIGH);
+  delay(450);
+  if (!isDevicePresent(0x29)) {
+    Serial.println("❌ Cảm biến LEFT không thức dậy ở 0x29!");
+    while (1) delay(200);
+  }
+  lox_left.begin(ADDR_LEFT, false, &Wire);
+
+  // RIGHT
+  pinMode(XSHUT_RIGHT, OUTPUT);
+  digitalWrite(XSHUT_RIGHT, HIGH);
+  delay(450);
+  if (!isDevicePresent(0x29)) {
+    Serial.println("❌ Cảm biến RIGHT không thức dậy ở 0x29!");
+    while (1) delay(200);
+  }
+  lox_right.begin(ADDR_RIGHT, false, &Wire);
+
+  Serial.println("[SYSTEM] Khởi động thành công 3 cảm biến Laser!\n");
+}
+
+int readDistanceLeft() {
+  VL53L0X_RangingMeasurementData_t measure;
+  lox_left.rangingTest(&measure, false);
+  if (measure.RangeStatus != 4) {
+    return measure.RangeMilliMeter + OFFSET_LEFT;
+  }
+  return 9999;
+}
+
+int readDistanceCenter() {
+  VL53L0X_RangingMeasurementData_t measure;
+  lox_center.rangingTest(&measure, false);
+  if (measure.RangeStatus != 4) {
+    return measure.RangeMilliMeter + OFFSET_CENTER;
+  }
+  return 9999;
+}
+
+int readDistanceRight() {
+  VL53L0X_RangingMeasurementData_t measure;
+  lox_right.rangingTest(&measure, false);
+  if (measure.RangeStatus != 4) {
+    return measure.RangeMilliMeter + OFFSET_RIGHT;
+  }
+  return 9999;
+}
+
+// ============================================================================
+// 5. CẢM BIẾN GYRO MPU6050
+// ============================================================================
+void calibrateGyro() {
+  Serial.println("[GYRO] Hiệu chuẩn Gyro... Giữ robot đứng yên...");
+  sensors_event_t accel, gyro, temp;
+  float sum = 0;
+  const int samples = 200;
+  for (int i = 0; i < samples; i++) {
+    mpu.getEvent(&accel, &gyro, &temp);
+    sum += gyro.gyro.z;
+    delay(2);
+  }
+  gyroZOffset = sum / samples;
+  Serial.printf("[GYRO] Offset Z: %.6f\n", gyroZOffset);
+}
+
+void updateHeading() {
+  unsigned long now = millis();
+  float dt = (now - lastGyroTime) / 1000.0;
+  lastGyroTime = now;
+  if (dt > 0.1) dt = 0.01; // Chống nhảy vọt thời gian khi delay lâu
+  
+  sensors_event_t accel, gyro, temp;
+  mpu.getEvent(&accel, &gyro, &temp);
+  
+  gyroZDeg = (gyro.gyro.z - gyroZOffset) * 57.2957795 * GYRO_SIGN; 
+  currentHeading += gyroZDeg * dt;
+}
+
+// ============================================================================
+// 6. CÁC HÀM QUAY XE CHÍNH XÁC BẰNG GYRO MPU6050
+// ============================================================================
+
+// Bộ xoay nhấp nhả thông minh kiểu động cơ bước (Stepper-like Pulsed Rotation)
+// Nhích nhẹ từng bước lớn khoảng 15 độ (xung 80ms, phanh 30ms), phanh cứng lập tức để triệt tiêu quán tính và triệt tiêu trượt bánh
+void stepRotateToHeading(float target) {
+  Serial.printf("  -> Đích xoay (Bộ nhớ góc): %.1f | Hiện tại: %.1f\n", target, currentHeading);
+  Serial.println("  -> Khởi động chế độ nhấp nhả nhích từng bước 15 độ...");
+  
+  unsigned long startTurnTime = millis();
+  while (millis() - startTurnTime < 4500) { // Giới hạn thời gian xoay tối đa 4.5 giây để bảo vệ xe
+    updateHeading();
+    float error = target - currentHeading;
+    
+    // Nếu lọt vào vùng sai số góc cực nhỏ (< 1.5 độ), dừng hoàn toàn cú xoay
+    if (abs(error) < 1.5) {
+      Serial.printf("  -> Hoàn thành nhấp nhả góc đích! Sai số còn lại: %.2f độ\n", error);
+      break;
+    }
+    
+    // Tốc độ xung quay đủ lực để nhích 15 độ chuẩn xác
+    int pulseSpeed = 85; 
+    int leftSpd = 0;
+    int rightSpd = 0;
+    
+    if (error > 0) {
+      // Cần xoay trái (lùi trái, tiến phải)
+      leftSpd = -pulseSpeed;
+      rightSpd = pulseSpeed;
+    } else {
+      // Cần xoay phải (tiến trái, lùi phải)
+      leftSpd = pulseSpeed;
+      rightSpd = -pulseSpeed;
+    }
+    
+    // Phát xung chuyển động 80ms (nhích khoảng 15 độ)
+    setMotors(leftSpd, rightSpd);
+    delay(80); 
+    
+    // Phanh cứng ngay lập tức bằng cách ngắt động cơ để dừng khựng không trượt
+    setMotors(0, 0);
+    delay(30); // Nghỉ 30ms để xe đứng yên ổn định và cảm biến Gyro đọc hướng cực kỳ ổn định
+  }
+  
+  setMotors(0, 0);
+  delay(150); // Cho xe đứng yên hoàn toàn
+}
+
+// Quay trái 90 độ: lùi bánh trái (-), tiến bánh phải (+)
+void turnLeft90() {
+  Serial.println("\n>>> [EXECUTE] QUAY TRÁI 90 ĐỘ (Nhấp nhả Stepper) <<<");
+  setMotors(0, 0);
+  delay(150);
+  
+  float startHeading = currentHeading;
+  float targetHeading = startHeading + 90.0;
+  
+  // Thực hiện xoay nhấp nhả từng bước 2 độ khép kín
+  stepRotateToHeading(targetHeading);
+  
+  lastTurnTime = millis();
+  lastGyroTime = millis(); // Reset mốc thời gian gyro để tránh nhảy vọt tích phân
+}
+
+// Quay đầu 180 độ: lùi bánh phải (-), tiến bánh trái (+)
+void turnAround180() {
+  Serial.println("\n>>> [EXECUTE] QUAY ĐẦU 180 ĐỘ (Nhấp nhả Stepper) <<<");
+  setMotors(0, 0);
+  delay(150);
+  
+  float startHeading = currentHeading;
+  float targetHeading = startHeading - 180.0;
+  
+  // Thực hiện xoay nhấp nhả từng bước 2 độ khép kín
+  stepRotateToHeading(targetHeading);
+  
+  lastTurnTime = millis();
+  lastGyroTime = millis();
+}
+
+// Quay phải 90 độ: lùi bánh phải (-), tiến bánh trái (+)
+void turnRight90() {
+  Serial.println("\n>>> [EXECUTE] QUAY PHẢI 90 ĐỘ (Nhấp nhả Stepper) <<<");
+  setMotors(0, 0);
+  delay(150);
+  
+  float startHeading = currentHeading;
+  float targetHeading = startHeading - 90.0;
+  
+  // Thực hiện xoay nhấp nhả từng bước 2 độ khép kín
+  stepRotateToHeading(targetHeading);
+  
+  lastTurnTime = millis();
+  lastGyroTime = millis();
+}
+
+// ============================================================================
+// 7. SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n==================================================");
+  Serial.println("🤖 ROBOCAR — THUẬT TOÁN GIẢI MÊ CUNG BÁM TƯỜNG TRÁI");
+  Serial.println("==================================================");
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(30000);
+  delay(200);
+
+  // MPU6050
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("❌ Không tìm thấy Gyro MPU6050!");
+    while (1) delay(100);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // Laser sensors
+  initLaserSensors();
+
+  // Motors
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  setMotors(0, 0);
+
+  // Calibrate Gyro
+  calibrateGyro();
+  lastGyroTime = millis();
+
+  Serial.println("🎉 SẴN SÀNG GIẢI MÊ CUNG! Bắt đầu chạy sau 3 giây...");
+  delay(3000);
+}
+
+// ============================================================================
+// 8. VÒNG LẶP CHÍNH (LUỒNG QUYẾT ĐỊNH GIẢI MÊ CUNG)
+// ============================================================================
+void loop() {
+  // Cập nhật góc hướng và vận tốc góc liên tục từ Gyro
+  updateHeading();
+
+  // Đọc thô 3 cảm biến khoảng cách
+  int rawL = readDistanceLeft();
+  int rawR = readDistanceRight();
+  int rawC = readDistanceCenter();
+
+  // --------------------------------------------------------------------------
+  // BẢO VỆ CHỐNG VA CHẠM KHẨN CẤP (CRASH RECOVERY)
+  // Nếu vô tình va chạm hoặc tiến quá sát tường trước (< 55mm / 5.5cm), lùi cứu hộ ngay!
+  // --------------------------------------------------------------------------
+  if (rawC != 9999 && rawC < 55) {
+    Serial.printf("\n🚨 [EMERGENCY] Quá sát tường trước! (RawC: %d mm) -> Kích hoạt lùi cứu hộ khẩn cấp...\n", rawC);
+    setMotors(0, 0);
+    delay(100);
+    setMotors(-110, -110); // Lùi thẳng mạnh mẽ để tách khỏi tường
+    delay(350); 
+    setMotors(0, 0);
+    delay(150);
+    
+    // Cập nhật lại các cảm biến tức thời sau khi lùi cứu hộ
+    rawL = readDistanceLeft();
+    rawR = readDistanceRight();
+    rawC = readDistanceCenter();
+  }
+
+  // Lọc nhiễu cảm biến bằng bộ lọc EMA ổn định (Đặt về 999.0 nếu mất tường / ngoài phạm vi)
+  if (rawL < 350) smoothLeft = EMA_ALPHA * rawL + (1.0 - EMA_ALPHA) * smoothLeft;
+  else smoothLeft = 999.0;
+
+  if (rawR < 350) smoothRight = EMA_ALPHA * rawR + (1.0 - EMA_ALPHA) * smoothRight;
+  else smoothRight = 999.0;
+
+  if (rawC < 1000) smoothCenter = EMA_ALPHA * rawC + (1.0 - EMA_ALPHA) * smoothCenter;
+  else smoothCenter = 999.0;
+
+  // --------------------------------------------------------------------------
+  // TRƯỜNG HỢP 1: Gặp lối ra (Cả 3 phía đều trống trải > 250mm)
+  // --------------------------------------------------------------------------
+  // --------------------------------------------------------------------------
+  // TRƯỜNG HỢP 1: Gặp lối ra (Cả 3 phía đều trống trải > 250mm - Dùng raw để dừng ngay lập tức)
+  // --------------------------------------------------------------------------
+  if (rawL > 250 && rawR > 250 && rawC > 250) {
+    setMotors(0, 0);
+    Serial.println("\n🎉 [MAZE COMPLETED] ĐÃ TÌM THẤY LỐI RA! DỪNG XE HÀN TOÀN.");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  // Chỉ cho phép đưa ra quyết định rẽ (Trái, Phải, Quay đầu) nếu đã qua thời gian chờ (cooldown) để xe ổn định trong corridor mới
+  // Tránh việc cảm biến đọc ảo ngay sau khi rẽ dẫn tới quay tròn 360 độ liên tục
+  bool canTurn = (millis() - lastTurnTime > 700); 
+
+  if (canTurn) {
+    // --------------------------------------------------------------------------
+    // TRƯỜNG HỢP 3: Gặp ngõ cụt (Dùng raw để quyết định tức thời ở khoảng cách 180mm, chống tông tường)
+    // Cực kỳ quan trọng: Bắt buộc trái phải bị chặn (rawL <= 240, rawR < 200) thì mới quay đầu!
+    // --------------------------------------------------------------------------
+    if (rawC <= 180 && rawL <= 240 && rawR < 200) {
+      Serial.printf("\n🔴 [DECISION] Ngõ cụt thực tế! (RawC: %d mm) -> Lùi lại trước khi quay...\n", rawC);
+      
+      // Thực hiện lùi lại 60mm để lấy không gian xoay rộng rãi
+      int startCenterDist = rawC;
+      unsigned long startMoveTime = millis();
+      setMotors(-100, -100); // Lùi thẳng
+      
+      bool foundLeftDuringReverse = false;
+      bool foundRightDuringReverse = false;
+      
+      while (millis() - startMoveTime < 450) {
+        int currentCenter = readDistanceCenter();
+        int currentLeft = readDistanceLeft();
+        int currentRight = readDistanceRight();
+        
+        // Nếu sườn trái mở ra trong lúc lùi (cực kỳ thông minh!)
+        if (currentLeft != 9999 && currentLeft > 240) {
+          foundLeftDuringReverse = true;
+        }
+        // Nếu sườn phải mở ra trong lúc lùi (cực kỳ thông minh!)
+        if (currentRight != 9999 && currentRight > 240) {
+          foundRightDuringReverse = true;
+        }
+        
+        if (currentCenter != 9999 && currentCenter >= startCenterDist + 60) {
+          Serial.printf("  -> Đã lùi đủ 60mm để tạo đà (%d mm -> %d mm)\n", startCenterDist, currentCenter);
+          break;
+        }
+        delay(10);
+      }
+      setMotors(0, 0);
+      delay(150);
+      
+      if (foundLeftDuringReverse) {
+        Serial.println("  -> [INTELLIGENT MEMORY] Phát hiện ngã rẽ TRÁI khi lùi! Rẽ TRÁI 90 độ thay vì quay đầu.");
+        turnLeft90();
+      } 
+      else if (foundRightDuringReverse) {
+        Serial.println("  -> [INTELLIGENT MEMORY] Phát hiện ngã rẽ PHẢI khi lùi! Rẽ PHẢI 90 độ thay vì quay đầu.");
+        turnRight90();
+      }
+      else {
+        turnAround180();
+      }
+      
+      // Reset hướng Gyro về 0 để làm mốc bám thẳng corridor mới
+      currentHeading = 0.0;
+      
+      // Reset bộ lọc
+      smoothLeft = 45.0;
+      smoothCenter = 300.0;
+      smoothRight = 45.0;
+      return;
+    }
+
+    // --------------------------------------------------------------------------
+    // TRƯỜNG HỢP 3B: Góc rẽ phải bắt buộc (Trước <= 180mm, trái cản <= 240mm, phải trống >= 200mm)
+    // --------------------------------------------------------------------------
+    if (rawC <= 180 && rawL <= 240 && rawR >= 200) {
+      Serial.printf("\n🔵 [DECISION] Góc rẽ PHẢI bắt buộc! (RawC: %d mm) -> Lùi lại trước khi quay...\n", rawC);
+      
+      // Thực hiện lùi lại 60mm để lấy không gian xoay rộng rãi
+      int startCenterDist = rawC;
+      unsigned long startMoveTime = millis();
+      setMotors(-100, -100); // Lùi thẳng
+      
+      bool foundLeftDuringReverse = false;
+      while (millis() - startMoveTime < 450) {
+        int currentCenter = readDistanceCenter();
+        int currentLeft = readDistanceLeft();
+        
+        // Nếu sườn trái mở ra trong lúc lùi (cực kỳ thông minh!)
+        if (currentLeft != 9999 && currentLeft > 240) {
+          foundLeftDuringReverse = true;
+        }
+        
+        if (currentCenter != 9999 && currentCenter >= startCenterDist + 60) {
+          Serial.printf("  -> Đã lùi đủ 60mm để tạo đà (%d mm -> %d mm)\n", startCenterDist, currentCenter);
+          break;
+        }
+        delay(10);
+      }
+      setMotors(0, 0);
+      delay(150);
+      
+      if (foundLeftDuringReverse) {
+        Serial.println("  -> [INTELLIGENT MEMORY] Phát hiện ngã rẽ TRÁI khi lùi! Rẽ TRÁI 90 độ thay vì rẽ phải.");
+        turnLeft90();
+      } else {
+        turnRight90();
+      }
+      
+      // Reset hướng Gyro về 0 để làm mốc bám thẳng corridor mới
+      currentHeading = 0.0;
+      
+      // Reset bộ lọc
+      smoothLeft = 45.0;
+      smoothCenter = 300.0;
+      smoothRight = 45.0;
+      return;
+    }
+
+    // --------------------------------------------------------------------------
+    // TRƯỜNG HỢP 2: Gặp lối đi bên trái (Dùng raw để phản ứng tức thời không trễ EMA)
+    // --------------------------------------------------------------------------
+    if (rawL > 240) {
+      int startCenterDist = rawC;
+      
+      // PHÂN NHÁNH 2A: Tường trước cũng đang bị CHẶN (rawC <= 180) - Đây là góc cua vuông L hoặc chữ T cụt đầu
+      // Tuyệt đối KHÔNG TIẾN THÊM để tránh đâm tường! Thay vào đó, lùi nhẹ 50mm lấy đà rồi rẽ trái tại chỗ!
+      if (rawC <= 180) {
+        Serial.printf("\n🟢 [DECISION] Góc cua TRÁI vuông đầu! Tường trước chặn (RawC: %d mm) -> Lùi nhẹ lấy đà rồi rẽ...\n", rawC);
+        
+        // Thực hiện lùi lại 50mm để lấy không gian xoay sườn trái không quẹt góc
+        unsigned long startMoveTime = millis();
+        setMotors(-100, -100); // Lùi thẳng
+        while (millis() - startMoveTime < 400) {
+          int currentCenter = readDistanceCenter();
+          if (currentCenter != 9999 && currentCenter >= startCenterDist + 50) {
+            Serial.printf("  -> Đã lùi đủ 50mm tạo đà (%d mm -> %d mm)\n", startCenterDist, currentCenter);
+            break;
+          }
+          delay(10);
+        }
+        setMotors(0, 0);
+        delay(150);
+        
+        // Rẽ trái 90 độ tại chỗ
+        turnLeft90();
+        
+        // Reset hướng Gyro về 0 để làm mốc bám thẳng corridor mới
+        currentHeading = 0.0;
+        
+        // Reset bộ lọc
+        smoothLeft = 45.0;
+        smoothCenter = 300.0;
+        smoothRight = 45.0;
+        return;
+      }
+      
+      // PHÂN NHÁNH 2B: Phía trước hoàn toàn THÔNG THOÁNG (rawC > 180) - Đây là ngã ba bên sườn
+      // Tiến thẳng thêm 150mm để đưa trục bánh xe vào chính giữa tâm ngã tư rồi mới ôm cua ôm sát
+      Serial.printf("\n🟢 [DECISION] Phát hiện lối đi bên TRÁI hành lang trống! (RawL: %d mm | RawC: %d mm) -> Tiến thẳng 150mm...\n", rawL, rawC);
+      
+      unsigned long startMoveTime = millis();
+      // Trước khi rẽ trái, dịch xe sang PHẢI (lái phải nhẹ) để lấy khoảng trống bên sườn trái xoay cho an toàn
+      setMotors(120, 85); 
+      
+      // Tiến lên cho đến khi khoảng cách trước mặt giảm đi 150mm
+      // Hoặc tiến tối đa 550ms làm phương án dự phòng an toàn (khi phía trước hoàn toàn trống trải)
+      while (millis() - startMoveTime < 550) {
+        int currentCenter = readDistanceCenter();
+        int currentRight = readDistanceRight();
+        
+        // Nếu sườn phải quá sát (< 50mm / 5cm), hủy dịch phải để tránh cọ xát
+        if (currentRight != 9999 && currentRight < 50) {
+          setMotors(100, 100); // Chạy thẳng bình thường
+        }
+        
+        // Nếu có tường trước mặt và khoảng cách đã giảm đi 150mm
+        if (startCenterDist < 300 && currentCenter != 9999) {
+          if (currentCenter <= startCenterDist - 150) {
+            Serial.printf("  -> Đã tiến đủ 150mm dựa theo cảm biến giữa (%d mm -> %d mm)\n", startCenterDist, currentCenter);
+            break;
+          }
+        }
+        delay(10);
+      }
+      
+      setMotors(0, 0);
+      delay(150);
+      
+      // Thực hiện quay trái 90 độ (Lùi bánh trái, tiến bánh phải)
+      turnLeft90();
+      
+      // Reset hướng Gyro về 0 để làm mốc bám thẳng corridor mới
+      currentHeading = 0.0;
+      
+      // Khởi tạo lại bộ lọc để tránh kích hoạt lại rẽ ngay lập tức
+      smoothLeft = 45.0;
+      smoothCenter = 300.0;
+      smoothRight = 45.0;
+      return;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // TRƯỜNG HỢP 4: Bám tường thông minh (Ưu tiên Trái, Né Phải, Tự động bám Phải khi mất Trái)
+  // --------------------------------------------------------------------------
+  float dynamicTarget = WALL_TARGET; // Mặc định bám sườn trái 30mm (3cm)
+
+  // CHỦ ĐỘNG DỊCH SANG TRÁI TRƯỚC KHI QUAY ĐẦU (180 ĐỘ VÀ RẼ PHẢI):
+  // Khi chuẩn bị gặp tường chặn phía trước (rawC <= 260) và bên trái có tường (rawL <= 240)
+  // Dịch target bám trái xuống 18mm để xe ép sát sườn trái, tạo khoảng trống khổng lồ bên sườn phải để xoay phải an toàn!
+  if (rawC <= 260 && rawL <= 240) {
+    dynamicTarget = 18.0; 
+  }
+
+  float wallError = 0.0;
+  
+  if (smoothLeft <= 180 && smoothRight <= 180) {
+    // A. Cả 2 bên đều có tường sát: Bám tường trái theo dynamicTarget, nhưng nếu tường phải quá sát (< 45mm) thì tự động rẽ trái để né
+    wallError = smoothLeft - dynamicTarget;
+    if (smoothRight < 45) {
+      float avoidRight = 45.0 - smoothRight;
+      wallError += avoidRight * 1.5; // Hỗ trợ lực rẽ trái mạnh mẽ để thoát hiểm phải
+    }
+  }
+  else if (smoothLeft <= 180 && smoothRight > 180) {
+    // B. Chỉ có tường trái: Bám tường trái bình thường theo dynamicTarget
+    wallError = smoothLeft - dynamicTarget;
+  }
+  else if (smoothLeft > 180 && smoothRight <= 180) {
+    // C. Mất tường trái nhưng có tường phải: Tự động chuyển sang bám tường phải ở khoảng cách an toàn 50mm!
+    // Tránh việc xe bị trôi và cọ xát/đâm vào tường phải khi mất tường trái.
+    wallError = 50.0 - smoothRight; 
+  }
+  else {
+    // D. Trống cả 2 bên: Giữ hướng thẳng tuyệt đối
+    wallError = 0.0;
+  }
+  
+  // Tính toán điều chỉnh PD kết hợp Gyro Z
+  float correction = (Kp * wallError) - (KdGyro * gyroZDeg);
+  correction = constrain(correction, -maxCorrection, maxCorrection);
+
+  // Tính toán tốc độ motor (PWMA = Left, PWMB = Right)
+  int leftSpeed = constrain(BASE_SPEED - correction, -255, 255);
+  int rightSpeed = constrain(BASE_SPEED + correction, -255, 255);
+
+  setMotors(leftSpeed, rightSpeed);
+
+  // In log bám tường gọn gàng mỗi 100ms
+  static unsigned long lastLogPD = 0;
+  if (millis() - lastLogPD >= 100) {
+    lastLogPD = millis();
+    Serial.printf("L:%3.0f C:%3.0f R:%3.0f | Err:%+5.1f | GyroZ:%+6.1f | SpdL:%3d SpdR:%3d\n", 
+                  smoothLeft, smoothCenter, smoothRight, wallError, gyroZDeg, leftSpeed, rightSpeed);
+  }
+
+  delay(10); 
+}
