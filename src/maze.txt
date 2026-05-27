@@ -9,8 +9,8 @@
 // ============================================================================
 
 // Định nghĩa chân XSHUT điều khiển khởi động độc lập cho 3 cảm biến VL53L0X
-#define XSHUT_CENTER 17
-#define XSHUT_LEFT   15
+#define XSHUT_CENTER 15
+#define XSHUT_LEFT   17
 #define XSHUT_RIGHT  16
 
 // Địa chỉ I2C tùy biến sau khi gán địa chỉ mới cho 3 cảm biến VL53L0X
