@@ -49,8 +49,8 @@ const float LIMIT_MID_MIN       = 0.0;
 const float LIMIT_MID_MAX       = 180.0; 
 const float LIMIT_OUTER_MIN     = 0.0;
 const float LIMIT_OUTER_MAX     = 180.0; 
-const float LIMIT_GRIPPER_MIN   = 0.0;   // Giới hạn khép tối đa ở góc 0 độ (vị trí lúc khởi động)
-const float LIMIT_GRIPPER_MAX   = 90.0;  // Giới hạn mở tối đa ở góc 90 độ
+const float LIMIT_GRIPPER_MIN   = 0.0;   // Giới hạn tối thiểu ban đầu (0 độ) để tìm góc khép/mở
+const float LIMIT_GRIPPER_MAX   = 180.0; // Tăng thêm 90 độ nữa (từ 90.0 lên 180.0) để thử nghiệm toàn bộ dải servo
 
 // Tốc độ di chuyển góc servo
 const float SPEED_JOYSTICK = 1.2;
@@ -281,8 +281,8 @@ void updateServos() {
 
   if (tayCam->a() || tayCam->b()) {
     attachGripper();
-    if (tayCam->b()) angleGripper += SPEED_GRIPPER; // Nút B -> Mở kẹp gắp (Tăng góc lên 90 độ)
-    if (tayCam->a()) angleGripper -= SPEED_GRIPPER; // Nút A -> Đóng kẹp gắp (Giảm góc về 0 độ)
+    if (tayCam->b()) angleGripper += SPEED_GRIPPER; // Nút B -> Tăng góc (Mở hoặc đóng tùy cấu trúc lắp ráp)
+    if (tayCam->a()) angleGripper -= SPEED_GRIPPER; // Nút A -> Giảm góc (Đóng hoặc mở tùy cấu trúc lắp ráp)
     angleGripper = constrain(angleGripper, LIMIT_GRIPPER_MIN, LIMIT_GRIPPER_MAX);
     servoGripper.write((int)angleGripper);
   }
